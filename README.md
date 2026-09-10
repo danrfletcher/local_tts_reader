@@ -90,8 +90,16 @@ Default server URL: `http://localhost:8000/v1/audio/speech`
 ## How reading works
 
 When you hit play, the extension:
-1. Captures the current selection (or the whole page if nothing is
-   selected) and splits it into sentences.
+1. Captures the current selection, or — if nothing is selected — tries
+   to extract just the article content of the page (dropping nav bars,
+   ads, sidebars, related-links widgets, etc.) using a vendored copy of
+   [Mozilla's Readability.js](https://github.com/mozilla/readability),
+   the same extraction library behind Firefox's Reader View. When that
+   succeeds, the extracted article is shown in a clean, distraction-free
+   overlay (closeable, or press Esc) and read from there; if extraction
+   fails or the page doesn't look like a single article, it falls back
+   to reading the whole page exactly as before. Either way, the result
+   is split into sentences.
 2. Requests the first sentence's audio. The very first request of a
    new session uses a longer timeout (45-60s) and the popup shows
    "Starting voice engine…", since some local TTS backends need time
@@ -119,8 +127,10 @@ The extension's main files:
 - `background.js`: Service worker — owns the reading session (chunking,
   prefetch, timeouts/retries, cold-start state)
 - `contentScript.js` / `sentenceSplitter.js`: Injected into the page to
-  capture the selection, split it into sentences, and highlight the
-  sentence currently playing
+  capture the selection (or extracted article), split it into
+  sentences, and highlight the sentence currently playing
+- `vendor/readability.js`: Unmodified vendored copy of Mozilla's
+  Readability.js (Apache-2.0, see `vendor/LICENSE-mozilla-readability.md`)
 - `offscreen.js` / `offscreen.html`: Plays each sentence's audio
 - `popup.html` / `popup.js`: UI and settings
 - `textProcessor.js`: Strips markdown/URLs before sending text to TTS

@@ -18,6 +18,17 @@
  * Custom Highlight API paints a Range without touching the DOM tree at
  * all, so partial/multi-element ranges just work. Supported in Chrome
  * 105+, which covers any Chrome capable of running this MV3 extension.
+ *
+ * When nothing is selected, whole-page reads first try to extract just
+ * the article content via vendor/readability.js (dropping nav/ads/
+ * sidebars) and render it into a distraction-free overlay we inject
+ * ourselves — see buildReaderOverlay(). Readability's own output is a
+ * cleaned/detached copy, not a live reference into the page, so it
+ * can't be used to build Ranges directly; rendering it into fresh DOM
+ * we control sidesteps that while reusing the same sentence-splitting
+ * and highlighting code as the selection path. If extraction fails or
+ * the result looks too thin, this falls back to reading document.body
+ * exactly as before.
  */
 (function () {
   if (window.__ttsContentScriptInstalled) {
@@ -26,6 +37,7 @@
   window.__ttsContentScriptInstalled = true;
 
   const HIGHLIGHT_NAME = 'tts-reader-highlight';
+  const MIN_READABLE_LENGTH = 200;
   const BLOCK_TAGS = new Set([
     'P', 'DIV', 'LI', 'UL', 'OL', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
     'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'NAV', 'ASIDE', 'MAIN',
@@ -37,16 +49,79 @@
 
   let currentSessionId = 0;
   let sentenceRanges = [];
+  let readerOverlayEl = null;
 
   function supportsCustomHighlight() {
     return typeof CSS !== 'undefined' && !!CSS.highlights && typeof Highlight !== 'undefined';
   }
 
-  function injectHighlightStyle() {
-    if (!supportsCustomHighlight() || document.getElementById('tts-reader-highlight-style')) return;
+  function injectStyle() {
+    if (document.getElementById('tts-reader-style')) return;
     const style = document.createElement('style');
-    style.id = 'tts-reader-highlight-style';
-    style.textContent = `::highlight(${HIGHLIGHT_NAME}) { background-color: rgba(233, 69, 96, 0.45); color: inherit; }`;
+    style.id = 'tts-reader-style';
+    style.textContent = `
+      ${supportsCustomHighlight() ? `::highlight(${HIGHLIGHT_NAME}) { background-color: rgba(233, 69, 96, 0.45); color: inherit; }` : ''}
+
+      #tts-reader-overlay-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        background: rgba(0, 0, 0, 0.6);
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        padding: 5vh 20px;
+        box-sizing: border-box;
+      }
+      #tts-reader-overlay {
+        position: relative;
+        background: #1a1a2e;
+        color: #e6e6e6;
+        max-width: 700px;
+        width: 100%;
+        max-height: 90vh;
+        overflow-y: auto;
+        border-radius: 10px;
+        padding: 50px 40px 40px;
+        box-sizing: border-box;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        line-height: 1.6;
+      }
+      #tts-reader-overlay-close {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        width: 32px;
+        height: 32px;
+        border: none;
+        border-radius: 50%;
+        background: #0f3460;
+        color: #e6e6e6;
+        font-size: 18px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      #tts-reader-overlay-close:hover {
+        background: #e94560;
+      }
+      #tts-reader-overlay-title {
+        margin: 0 0 20px;
+        font-size: 1.6em;
+        line-height: 1.3;
+      }
+      #tts-reader-overlay-content img {
+        max-width: 100%;
+        height: auto;
+      }
+      #tts-reader-overlay-content a {
+        color: #e94560;
+      }
+      #tts-reader-overlay-content pre {
+        white-space: pre-wrap;
+        overflow-x: auto;
+      }
+    `;
     (document.head || document.documentElement).appendChild(style);
   }
 
@@ -190,6 +265,111 @@
     return domRange;
   }
 
+  /**
+   * Try to extract just the article content of the page via the
+   * vendored Readability library, run against a clone (Readability
+   * mutates whatever document it's given, so the live page must never
+   * be passed directly). Returns null if the library isn't available,
+   * extraction fails, or the result looks too thin to be a real
+   * article (e.g. a listing/homepage rather than a single article).
+   */
+  function tryExtractReadableArticle() {
+    if (typeof Readability === 'undefined') return null;
+    try {
+      const clone = document.cloneNode(true);
+      const result = new Readability(clone, { charThreshold: MIN_READABLE_LENGTH }).parse();
+      if (!result || !result.content) return null;
+      if ((result.textContent || '').trim().length < MIN_READABLE_LENGTH) return null;
+      return { title: result.title || '', contentHTML: result.content };
+    } catch (e) {
+      console.error('[TTS Reader] Readability extraction failed:', e);
+      return null;
+    }
+  }
+
+  /**
+   * Parse Readability's output HTML in a detached document and strip
+   * anything that shouldn't run/load when inserted into the real page
+   * (script/style/iframe/etc. tags, inline event handlers, javascript:
+   * URLs). Readability already does its own cleaning as part of
+   * extraction, but this is cheap, defensive, belt-and-suspenders
+   * safety before the result is grafted into the live DOM.
+   * @returns {HTMLBodyElement} a body element (in a detached document)
+   *   containing only the sanitized content, ready to import.
+   */
+  function sanitizeArticleFragment(htmlString) {
+    const doc = new DOMParser().parseFromString(htmlString, 'text/html');
+    doc.querySelectorAll('script, style, iframe, object, embed, link, meta, form, base').forEach((el) => el.remove());
+    doc.querySelectorAll('*').forEach((el) => {
+      for (const attr of [...el.attributes]) {
+        const name = attr.name.toLowerCase();
+        if (name.startsWith('on')) {
+          el.removeAttribute(attr.name);
+        } else if ((name === 'href' || name === 'src') && /^\s*javascript:/i.test(attr.value)) {
+          el.removeAttribute(attr.name);
+        }
+      }
+    });
+    return doc.body;
+  }
+
+  /**
+   * Render an extracted article into a distraction-free overlay
+   * injected into the live page, so it has real, live DOM the rest of
+   * this file can build sentence Ranges into. Only one overlay exists
+   * at a time. Returns the content container to read from.
+   */
+  function buildReaderOverlay(article) {
+    removeReaderOverlay();
+
+    const backdrop = document.createElement('div');
+    backdrop.id = 'tts-reader-overlay-backdrop';
+
+    const panel = document.createElement('div');
+    panel.id = 'tts-reader-overlay';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+
+    const closeBtn = document.createElement('button');
+    closeBtn.id = 'tts-reader-overlay-close';
+    closeBtn.type = 'button';
+    closeBtn.setAttribute('aria-label', 'Close reading view and stop');
+    closeBtn.textContent = '×';
+    closeBtn.addEventListener('click', () => {
+      chrome.runtime.sendMessage({ type: 'stopSession' });
+    });
+    panel.appendChild(closeBtn);
+
+    if (article.title) {
+      const titleEl = document.createElement('h1');
+      titleEl.id = 'tts-reader-overlay-title';
+      titleEl.textContent = article.title;
+      panel.appendChild(titleEl);
+    }
+
+    const contentEl = document.createElement('div');
+    contentEl.id = 'tts-reader-overlay-content';
+    const cleanBody = sanitizeArticleFragment(article.contentHTML);
+    const importedBody = document.importNode(cleanBody, true);
+    while (importedBody.firstChild) {
+      contentEl.appendChild(importedBody.firstChild);
+    }
+    panel.appendChild(contentEl);
+
+    backdrop.appendChild(panel);
+    document.documentElement.appendChild(backdrop);
+    readerOverlayEl = backdrop;
+
+    return contentEl;
+  }
+
+  function removeReaderOverlay() {
+    if (readerOverlayEl && readerOverlayEl.isConnected) {
+      readerOverlayEl.remove();
+    }
+    readerOverlayEl = null;
+  }
+
   function getSourceRange(mode) {
     if (mode === 'selection') {
       const selection = window.getSelection();
@@ -197,7 +377,18 @@
         return selection.getRangeAt(0).cloneRange();
       }
     }
-    // Fall back to (or explicitly use) the whole page body.
+
+    // No selection (or explicit whole-page mode): try to read just the
+    // article, rendered into our own overlay so it has live DOM.
+    const article = tryExtractReadableArticle();
+    if (article) {
+      const contentRoot = buildReaderOverlay(article);
+      const range = document.createRange();
+      range.selectNodeContents(contentRoot);
+      return range;
+    }
+
+    // Extraction unavailable/failed: fall back to the whole page body.
     const range = document.createRange();
     range.selectNodeContents(document.body);
     return range;
@@ -209,6 +400,10 @@
    */
   function prepareSession(mode) {
     clearHighlight();
+    // Unconditional (not left to getSourceRange's Readability branch):
+    // a stale overlay from a previous whole-page session must not
+    // linger if this new session ends up reading a plain selection.
+    removeReaderOverlay();
     const sourceRange = getSourceRange(mode);
     const { fullText, segments } = buildTextMap(sourceRange);
     const boundaries = (window.SentenceSplitter || self.SentenceSplitter).findSentenceBoundaries(fullText);
@@ -251,6 +446,11 @@
       case 'ttsClearHighlight': {
         if (message.sessionId === currentSessionId || message.sessionId === undefined) {
           clearHighlight();
+          // Sent on real session end (stop/complete/error), unlike the
+          // clearHighlight() call inside highlightSentence() which just
+          // swaps the highlight between sentences mid-session — so this
+          // is the right place to also tear down the reading overlay.
+          removeReaderOverlay();
         }
         return false;
       }
@@ -258,6 +458,14 @@
     return false;
   });
 
-  window.addEventListener('beforeunload', clearHighlight);
-  injectHighlightStyle();
+  window.addEventListener('beforeunload', () => {
+    clearHighlight();
+    removeReaderOverlay();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && readerOverlayEl) {
+      chrome.runtime.sendMessage({ type: 'stopSession' });
+    }
+  });
+  injectStyle();
 })();

@@ -119,19 +119,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     case 'stateUpdate':
       currentPlayerState = message.state;
-      chrome.runtime.sendMessage({
-        type: 'playerStateUpdate',
-        state: message.state
-      });
+      broadcast({ type: 'playerStateUpdate', state: message.state });
       return true;
 
     case 'audioReady':
       if (currentPlayerState === 'loading' || currentPlayerState === 'starting') {
         currentPlayerState = 'ready';
-        chrome.runtime.sendMessage({
-          type: 'playerStateUpdate',
-          state: 'ready'
-        });
+        broadcast({ type: 'playerStateUpdate', state: 'ready' });
       }
       return true;
 
@@ -157,24 +151,31 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
 
     case 'getTimeInfo':
-      chrome.runtime.sendMessage({
-        type: 'getTimeInfo'
-      }).then((response) => {
-        sendResponse(response);
-      });
+      chrome.runtime.sendMessage({ type: 'getTimeInfo' })
+        .then((response) => sendResponse(response))
+        .catch(() => sendResponse(null)); // offscreen doc not up yet
       return true;
 
     case 'timeUpdate':
-      chrome.runtime.sendMessage(message);
+      broadcast(message);
       return true;
   }
 });
 
+// Fire-and-forget broadcast to other extension contexts (popup,
+// offscreen document). If nothing is listening right now (e.g. the
+// popup is closed) the promise rejects with "Could not establish
+// connection" — expected and harmless, but must be caught or Chrome
+// logs it as an uncaught error against the extension.
+function broadcast(message) {
+  chrome.runtime.sendMessage(message).catch(() => {});
+}
+
 function handleControlAudio(action) {
   if (action === 'pause') {
-    chrome.runtime.sendMessage({ type: 'pause' });
+    broadcast({ type: 'pause' });
   } else if (action === 'play') {
-    chrome.runtime.sendMessage({ type: 'play' });
+    broadcast({ type: 'play' });
   } else if (action === 'stop') {
     stopSession('user');
   }
@@ -199,7 +200,7 @@ async function beginSession(tabId, settings, isRecording, mode) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ['sentenceSplitter.js', 'contentScript.js']
+      files: ['vendor/readability.js', 'sentenceSplitter.js', 'contentScript.js']
     });
 
     const [{ result }] = await chrome.scripting.executeScript({
@@ -265,14 +266,14 @@ async function playFromIndex(s, index) {
     s.recordedChunks.push(audioResult);
   }
 
-  chrome.runtime.sendMessage({
+  broadcast({
     type: 'playChunk',
     audioData: Array.from(new Uint8Array(audioResult.arrayBuffer)),
     mimeType: audioResult.mimeType,
     index
   });
 
-  chrome.runtime.sendMessage({
+  broadcast({
     type: 'sentenceProgress',
     index,
     total: s.sentences.length
@@ -394,13 +395,13 @@ function stopSession(_reason) {
   }
   s.abortControllers.clear();
   s.prefetch = null;
-  chrome.runtime.sendMessage({ type: 'stop' });
+  broadcast({ type: 'stop' });
   clearPageHighlight(s);
   finalizeRecording(s);
   clearKeepAliveIfIdle();
   if (session === s) {
     currentPlayerState = 'stopped';
-    chrome.runtime.sendMessage({ type: 'playerStateUpdate', state: 'stopped' });
+    broadcast({ type: 'playerStateUpdate', state: 'stopped' });
   }
 }
 
@@ -411,7 +412,7 @@ function finalizeRecording(s) {
     const buffers = s.recordedChunks.map((c) => c.arrayBuffer);
     const blob = new Blob(buffers, { type: mimeType });
     const audioUrl = URL.createObjectURL(blob);
-    chrome.runtime.sendMessage({ type: 'recordingComplete', audioUrl });
+    broadcast({ type: 'recordingComplete', audioUrl });
   } catch (e) {
     console.error('Error assembling recorded audio:', e);
   }
@@ -419,11 +420,11 @@ function finalizeRecording(s) {
 
 function setPlayerState(state) {
   currentPlayerState = state;
-  chrome.runtime.sendMessage({ type: 'playerStateUpdate', state });
+  broadcast({ type: 'playerStateUpdate', state });
 }
 
 function broadcastError(message) {
-  chrome.runtime.sendMessage({ type: 'streamError', error: message });
+  broadcast({ type: 'streamError', error: message });
 }
 
 // --- Keep-alive heartbeat -------------------------------------------------
