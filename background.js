@@ -11,10 +11,13 @@ let session = null;
 const FIRST_CHUNK_TIMEOUT_MS = 55000; // cold-start: backend may take ~30s to wake up
 const SUBSEQUENT_CHUNK_TIMEOUT_MS = 18000; // warm backend: ~1-2s typical
 const KEEPALIVE_ALARM_NAME = 'tts-reader-keepalive';
+const MIN_READABLE_FRAME_LENGTH = 200;
+const FRAME_PREFERENCE_MARGIN = 200;
 
-function newSession(tabId, settings, isRecording) {
+function newSession(tabId, frameId, settings, isRecording) {
   return {
     tabId,
+    frameId,
     settings,
     isRecording,
     sentences: [],
@@ -23,6 +26,7 @@ function newSession(tabId, settings, isRecording) {
     prefetch: null, // { index, promise } | { index, result: {arrayBuffer, mimeType} }
     abortControllers: new Map(), // index -> AbortController
     recordedChunks: [], // in order, for recordAudio
+    chunkWatchdogTimer: null,
     stopped: false
   };
 }
@@ -68,14 +72,19 @@ function setupContextMenu() {
 // Handle context menu clicks
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === "readAloud") {
-    startReadingFromTab(tab.id);
+    // info.frameId is populated by Chrome itself (browser-level, not
+    // page JS), so it correctly identifies the frame the user actually
+    // right-clicked/selected in — including inside a cross-origin
+    // iframe, which our own in-page window.getSelection() check could
+    // never see (each frame has its own separate selection state).
+    startReadingFromTab(tab.id, info.frameId);
   }
 });
 
 // contentScript.js's prepareSession() already falls back to the whole
 // page when there's no active selection, so 'selection' mode covers
 // both "text selected" and "nothing selected -> read the page" cases.
-async function startReadingFromTab(tabId) {
+async function startReadingFromTab(tabId, frameId) {
   try {
     const settings = await chrome.storage.local.get({
       serverUrl: 'http://localhost:8000/v1/audio/speech',
@@ -84,7 +93,7 @@ async function startReadingFromTab(tabId) {
       recordAudio: false,
       preprocessText: true
     });
-    await beginSession(tabId, settings, settings.recordAudio, 'selection');
+    await beginSession(tabId, settings, settings.recordAudio, 'selection', frameId);
   } catch (error) {
     console.error('Error starting reading from tab:', error);
     broadcastError(error.message);
@@ -183,7 +192,7 @@ function handleControlAudio(action) {
 
 // --- Session lifecycle ---------------------------------------------------
 
-async function beginSession(tabId, settings, isRecording, mode) {
+async function beginSession(tabId, settings, isRecording, mode, frameId) {
   // Any previous session is replaced.
   stopSession('replaced');
 
@@ -192,19 +201,27 @@ async function beginSession(tabId, settings, isRecording, mode) {
     return;
   }
 
-  const s = newSession(tabId, settings, isRecording);
-  session = s;
-
   setPlayerState('loading');
+
+  // The popup's Play button has no frame context (unlike the context
+  // menu, which gives us info.frameId directly) — probe every frame in
+  // the tab for one with an active selection, or failing that, whoever
+  // has substantially more text than the main frame (e.g. a page like
+  // wikiroulette.co that embeds the actual article in a same/cross-
+  // origin iframe and leaves only nav chrome in the main frame).
+  const resolvedFrameId = frameId != null ? frameId : await pickBestFrame(tabId, mode);
+
+  const s = newSession(tabId, resolvedFrameId, settings, isRecording);
+  session = s;
 
   try {
     await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, frameIds: [resolvedFrameId] },
       files: ['vendor/readability.js', 'sentenceSplitter.js', 'contentScript.js']
     });
 
     const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, frameIds: [resolvedFrameId] },
       func: (mode) => window.__ttsPrepareSession(mode),
       args: [mode]
     });
@@ -235,6 +252,55 @@ async function beginSession(tabId, settings, isRecording, mode) {
   }
 }
 
+/**
+ * Pick which frame in the tab to read from. A lightweight, standalone
+ * probe (no dependency on our other injected files) run in every frame
+ * via allFrames — cross-origin frames are reachable too, since the
+ * manifest's host_permissions already cover all http/https origins.
+ *
+ * - If reading a selection, prefer whichever frame actually has one.
+ * - Otherwise prefer the frame with substantially more text than the
+ *   main frame, so a page that embeds its real content in an iframe
+ *   (leaving only nav chrome in the main frame) still reads correctly.
+ *   The margin avoids being fooled by a modest ad/tracker iframe.
+ * - Falls back to the main frame (0) if probing fails entirely, or if
+ *   nothing clearly beats it.
+ */
+async function pickBestFrame(tabId, mode) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        const sel = window.getSelection();
+        const hasSelection = !!(sel && sel.rangeCount > 0 && !sel.isCollapsed && sel.toString().trim());
+        const textLength = document.body ? document.body.innerText.trim().length : 0;
+        return { hasSelection, textLength };
+      }
+    });
+
+    if (mode === 'selection') {
+      const withSelection = results.find((r) => r.result && r.result.hasSelection);
+      if (withSelection) return withSelection.frameId;
+    }
+
+    const mainFrame = results.find((r) => r.frameId === 0);
+    const mainLength = mainFrame?.result?.textLength || 0;
+    let best = mainFrame || results[0];
+    let bestLength = mainLength;
+    for (const r of results) {
+      const len = r.result?.textLength || 0;
+      if (r.frameId !== 0 && len >= MIN_READABLE_FRAME_LENGTH && len > mainLength + FRAME_PREFERENCE_MARGIN && len > bestLength) {
+        best = r;
+        bestLength = len;
+      }
+    }
+    return best ? best.frameId : 0;
+  } catch (error) {
+    console.error('Error probing frames:', error);
+    return 0;
+  }
+}
+
 async function playFromIndex(s, index) {
   if (!isActive(s) || index >= s.sentences.length) {
     finishSession(s);
@@ -261,6 +327,13 @@ async function playFromIndex(s, index) {
 
   if (!isActive(s)) return;
 
+  // Re-verify (cheap no-op if it already exists) rather than trusting
+  // the one-time setup at session start — guards against the offscreen
+  // document having been silently torn down mid-session, which would
+  // otherwise leave every future playChunk broadcast with no listener.
+  await setupOffscreenDocument();
+  if (!isActive(s)) return;
+
   s.currentIndex = index;
   if (s.isRecording) {
     s.recordedChunks.push(audioResult);
@@ -280,6 +353,7 @@ async function playFromIndex(s, index) {
   });
 
   notifyHighlight(s, index);
+  armChunkWatchdog(s, index);
 
   // Start prefetching the next chunk while this one plays.
   const nextIndex = index + 1;
@@ -290,9 +364,36 @@ async function playFromIndex(s, index) {
   }
 }
 
+// Chrome's tab-audio pipeline has occasionally been observed (verified
+// live, testing long infobox/reference-heavy pages) to silently stop
+// advancing after many dozens of rapid, very short chunks in a row: the
+// offscreen document acks 'audioReady' but neither onplay nor onended
+// ever fires afterward, and background.js has no signal that anything
+// went wrong — the session just sits there forever. Rather than leave
+// the whole read hung on one bad chunk, force-advance if a chunk we
+// believe is playing hasn't reported ended within a generous window.
+const CHUNK_WATCHDOG_MS = 20000;
+
+function armChunkWatchdog(s, index) {
+  clearChunkWatchdog(s);
+  s.chunkWatchdogTimer = setTimeout(() => {
+    if (!isActive(s) || s.currentIndex !== index) return;
+    console.warn(`[TTS Reader] Chunk ${index} never reported ended after ${CHUNK_WATCHDOG_MS}ms; advancing anyway.`);
+    playFromIndex(s, index + 1);
+  }, CHUNK_WATCHDOG_MS);
+}
+
+function clearChunkWatchdog(s) {
+  if (s.chunkWatchdogTimer) {
+    clearTimeout(s.chunkWatchdogTimer);
+    s.chunkWatchdogTimer = null;
+  }
+}
+
 async function handleChunkEnded(endedIndex) {
   const s = session;
   if (!s || s.stopped || endedIndex !== s.currentIndex) return;
+  clearChunkWatchdog(s);
   await playFromIndex(s, endedIndex + 1);
 }
 
@@ -366,7 +467,7 @@ function notifyHighlight(s, index) {
     type: 'ttsHighlightSentence',
     sessionId: s.contentSessionId,
     index
-  }).catch(() => {}); // tab may have navigated away; ignore
+  }, { frameId: s.frameId }).catch(() => {}); // tab/frame may have navigated away; ignore
 }
 
 function clearPageHighlight(s) {
@@ -374,12 +475,13 @@ function clearPageHighlight(s) {
   chrome.tabs.sendMessage(s.tabId, {
     type: 'ttsClearHighlight',
     sessionId: s.contentSessionId
-  }).catch(() => {});
+  }, { frameId: s.frameId }).catch(() => {});
 }
 
 function finishSession(s) {
   if (!isActive(s)) return;
   s.stopped = true;
+  clearChunkWatchdog(s);
   clearPageHighlight(s);
   finalizeRecording(s);
   clearKeepAliveIfIdle();
@@ -390,6 +492,7 @@ function stopSession(_reason) {
   const s = session;
   if (!s) return;
   s.stopped = true;
+  clearChunkWatchdog(s);
   for (const controller of s.abortControllers.values()) {
     controller.abort();
   }
