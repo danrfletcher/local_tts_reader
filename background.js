@@ -70,6 +70,19 @@ function newSession(tabId, frameId, settings, isRecording, sessionId) {
     abortControllers: new Map(), // index -> AbortController
     recordedChunks: [], // in order, for recordAudio
     stallTimer: null,
+    // Pause state. The background owns it: Pause, Play and Stop reach it from
+    // the popup (see handleControlAudio), never straight from the popup to the
+    // offscreen document.
+    paused: false,
+    // The sentence whose bytes were loaded while paused, kept until Play:
+    // { index, audioResult }.
+    heldChunk: null,
+    // A sentence ended while paused; Play plays the one after it.
+    advanceOnResume: false,
+    // Index of the sentence playFromIndex is fetching or about to hand to the
+    // audio element; null when none is in flight.
+    loadingIndex: null,
+    durationSec: null, // the current play's audio duration, once reported
     // Token of the start request that made this session. A later token means
     // this start was superseded; playFromIndex re-checks it for every
     // sentence, see supersededBeforePlay.
@@ -178,17 +191,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     case 'controlAudio':
-      handleControlAudio(message.action);
+      handleControlAudio(message);
       return true;
 
     case 'stopSession':
-      stopSession('user');
+      // The overlay's close button and Escape send this without a session id
+      // (the content script does not know it): that is always a Stop. A Stop
+      // that names a session only counts for the live one.
+      handleControlAudio({ action: 'stop', sessionId: message.sessionId });
       sendResponse({ success: true });
       return true;
 
     case 'stateUpdate':
-      currentPlayerState = message.state;
-      broadcast({ type: 'playerStateUpdate', state: message.state });
+      handleOffscreenState(message);
+      return true;
+
+    case 'getSessionState':
+      sendResponse(sessionStateSnapshot());
       return true;
 
     case 'audioReady':
@@ -197,8 +216,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       // the session that replaced it.
       if (!session || session.stopped || message.sessionId !== session.sessionId) return true;
       if (currentPlayerState === 'loading' || currentPlayerState === 'starting') {
-        currentPlayerState = 'ready';
-        broadcast({ type: 'playerStateUpdate', state: 'ready' });
+        // Through setPlayerState so the broadcast carries the session id; the
+        // popup disables Play for a live session in 'ready'.
+        setPlayerState('ready');
       }
       return true;
 
@@ -284,14 +304,159 @@ async function buildDebugLogFile() {
   };
 }
 
-function handleControlAudio(action) {
-  if (action === 'pause') {
-    broadcast({ type: 'pause' });
-  } else if (action === 'play') {
-    broadcast({ type: 'play' });
-  } else if (action === 'stop') {
-    stopSession('user');
+// --- Pause, Play and Stop ------------------------------------------------
+// The background owns the paused flag. Pause stops the stall timer, so a
+// paused session never advances by itself; nothing below starts a sentence
+// while `s.paused` is set except Play (see TTSPlayback.playbackTransition).
+
+/** What the popup reads when it opens, and before it picks Play's meaning. */
+function sessionStateSnapshot() {
+  const s = session;
+  if (!s || s.stopped) {
+    return { active: false, sessionId: null, paused: false, index: 0, total: 0 };
   }
+  return {
+    active: true,
+    sessionId: s.sessionId,
+    paused: s.paused,
+    index: Math.max(0, s.currentIndex),
+    total: s.sentences.length
+  };
+}
+
+// Where the session is, for TTSPlayback.playbackTransition. A session that has
+// not handed its first sentence over yet counts as loading.
+function phaseOf(s) {
+  if (!s) return 'idle';
+  if (s.stopped) return 'stopped';
+  if (s.paused) return 'paused';
+  if (s.loadingIndex !== null || s.currentPlayNumber === null) return 'loading';
+  return 'playing';
+}
+
+function flagsOf(s) {
+  return {
+    held: s.heldChunk !== null,
+    advanceOnResume: s.advanceOnResume,
+    fetchPending: s.loadingIndex !== null || s.currentPlayNumber === null
+  };
+}
+
+function logControlDropped(message, reason) {
+  logEvent('dropped-control', { sessionId: message.sessionId, reason });
+}
+
+function handleControlAudio(message) {
+  const { action } = message;
+  const s = session;
+  const live = Boolean(s) && !s.stopped;
+
+  if (action === 'stop') {
+    // No id: the overlay's Escape / close button, always a Stop.
+    if (message.sessionId == null) {
+      stopSession('user');
+      return;
+    }
+    if (!live || message.sessionId !== s.sessionId) {
+      logControlDropped(message, live ? 'stale-session' : 'no-session');
+      return;
+    }
+    stopSession('user');
+    return;
+  }
+
+  if (action !== 'pause' && action !== 'play') return;
+  if (!live) {
+    logControlDropped(message, 'no-session');
+    return;
+  }
+  if (message.sessionId !== s.sessionId) {
+    logControlDropped(message, 'stale-session');
+    return;
+  }
+
+  const transition = TTSPlayback.playbackTransition(phaseOf(s), action, flagsOf(s));
+  switch (transition.action) {
+    case 'pause':
+      s.paused = true;
+      clearStallTimer(s);
+      // The offscreen document may be gone (Chrome closes it after 30 s
+      // without audio); the pause is recorded here either way.
+      broadcast({ type: 'pause', sessionId: s.sessionId });
+      setPlayerState('paused');
+      logEvent('pause', { sessionId: s.sessionId, ...(s.currentIndex >= 0 ? { index: s.currentIndex } : {}) });
+      break;
+
+    case 'resume-audio':
+      // Same session, same sentence, nothing to fetch: the audio element
+      // carries on, and the stall timer is re-armed for that sentence.
+      s.paused = false;
+      broadcast({ type: 'play', sessionId: s.sessionId });
+      armStallTimer(s, s.currentIndex, s.currentPlayNumber, s.durationSec);
+      setPlayerState('playing');
+      logEvent('resume', { sessionId: s.sessionId, index: s.currentIndex, reason: 'resume-audio' });
+      break;
+
+    case 'resume-held': {
+      const index = s.heldChunk.index;
+      s.paused = false;
+      setPlayerState(index === 0 ? 'starting' : 'loading');
+      logEvent('resume', { sessionId: s.sessionId, index, reason: 'resume-held' });
+      runPlay(s, index);
+      break;
+    }
+
+    case 'resume-advance': {
+      const index = s.currentIndex + 1;
+      s.paused = false;
+      s.advanceOnResume = false;
+      setPlayerState('loading');
+      logEvent('resume', { sessionId: s.sessionId, index, reason: 'resume-advance' });
+      runPlay(s, index);
+      break;
+    }
+
+    case 'resume-wait':
+      // A fetch is still in flight; when it lands it plays, because the
+      // session is no longer paused.
+      s.paused = false;
+      setPlayerState(s.loadingIndex === null || s.loadingIndex === 0 ? 'starting' : 'loading');
+      logEvent('resume', { sessionId: s.sessionId, reason: 'resume-wait' });
+      break;
+
+    default:
+      // 'none': Pause twice, Play twice, or Play when there is nothing to
+      // resume (the popup starts a new session itself).
+      logControlDropped(message, 'no-op');
+  }
+}
+
+/** playFromIndex from a control path, with the same failure handling as a stall advance. */
+function runPlay(s, index) {
+  playFromIndex(s, index).catch((error) => {
+    console.error('Error playing after Play:', error);
+    if (!isActive(s)) return;
+    broadcastError(error.message);
+    stopSession('error');
+  });
+}
+
+// The offscreen document reports the audio element's own state. The
+// background owns paused and stopped, so only a 'playing' report from the
+// live, unpaused session is taken; anything from another session, or arriving
+// while paused or after Stop, is dropped.
+function handleOffscreenState(message) {
+  const s = session;
+  let reason = null;
+  if (!s || message.sessionId !== s.sessionId) reason = 'stale-session';
+  else if (s.stopped) reason = 'stopped';
+  else if (s.paused) reason = 'paused';
+  else if (message.state !== 'playing') reason = 'not-playing';
+  if (reason) {
+    logEvent('dropped-state-update', { sessionId: message.sessionId, reason });
+    return;
+  }
+  setPlayerState('playing');
 }
 
 // --- Session lifecycle ---------------------------------------------------
@@ -481,11 +646,17 @@ async function playFromIndex(s, index) {
     return;
   }
 
-  setPlayerState(index === 0 ? 'starting' : 'loading');
+  s.loadingIndex = index;
+  // A paused session keeps showing paused while its sentence loads.
+  if (!s.paused) setPlayerState(index === 0 ? 'starting' : 'loading');
 
   let audioResult;
   try {
-    if (s.prefetch && s.prefetch.index === index) {
+    if (s.heldChunk && s.heldChunk.index === index) {
+      // Held while paused: its bytes are already here, nothing to fetch.
+      audioResult = s.heldChunk.audioResult;
+      s.heldChunk = null;
+    } else if (s.prefetch && s.prefetch.index === index) {
       audioResult = await s.prefetch.promise;
       s.prefetch = null;
     } else {
@@ -518,6 +689,16 @@ async function playFromIndex(s, index) {
     return;
   }
 
+  // Pause may have arrived while this sentence loaded. Keep its bytes and
+  // send nothing until Play; the fetch is never aborted for a Pause.
+  const fetched = TTSPlayback.playbackTransition(phaseOf(s), 'fetchDone', flagsOf(s));
+  s.loadingIndex = null;
+  if (fetched.action === 'hold-chunk') {
+    s.heldChunk = { index, audioResult };
+    logEvent('chunk-held', { sessionId: s.sessionId, index });
+    return;
+  }
+
   s.currentIndex = index;
   if (s.isRecording) {
     s.recordedChunks.push(audioResult);
@@ -527,6 +708,7 @@ async function playFromIndex(s, index) {
   s.currentPlayNumber = playNumber;
   s.playEnded = false;
   s.durationKnown = false;
+  s.durationSec = null;
   broadcast({
     type: 'playChunk',
     audioData: Array.from(new Uint8Array(audioResult.arrayBuffer)),
@@ -577,7 +759,7 @@ function armStallTimer(s, index, playNumber, durationSec) {
   if (timeoutMs === null) return; // paused: no deadline
   s.stallTimer = setTimeout(() => {
     s.stallTimer = null;
-    if (!isActive(s) || s.currentIndex !== index || s.currentPlayNumber !== playNumber) return;
+    if (!isActive(s) || s.paused || s.currentIndex !== index || s.currentPlayNumber !== playNumber) return;
     // Counts as this play's end: a chunkEnded that turns up later is then a
     // duplicate and is ignored, and a stall after a real end does nothing.
     if (!s.endedLedger.accept(s.sessionId, index, playNumber).ok) return;
@@ -624,6 +806,15 @@ async function handleChunkEnded(message) {
   }
   s.playEnded = true;
   clearStallTimer(s);
+  const transition = TTSPlayback.playbackTransition(phaseOf(s), 'chunkEnded', flagsOf(s));
+  if (transition.action === 'defer-advance') {
+    // Paused: the sentence ended but the session must not move on. Play
+    // plays the next one, once.
+    s.advanceOnResume = true;
+    logEvent('advance-deferred', { sessionId: s.sessionId, index: message.index });
+    return;
+  }
+  if (transition.action !== 'advance') return;
   await playFromIndex(s, message.index + 1);
 }
 
@@ -644,6 +835,7 @@ function handleAudioDuration(message) {
     return;
   }
   s.durationKnown = true;
+  s.durationSec = message.duration;
   logEvent('audio-duration', { ...messageIds(message), ms: Math.round(message.duration * 1000) });
   armStallTimer(s, message.index, message.playNumber, message.duration);
 }
@@ -756,9 +948,17 @@ function clearPageHighlight(s) {
   }, { frameId: s.frameId }).catch(() => {});
 }
 
+function clearPauseState(s) {
+  s.paused = false;
+  s.heldChunk = null;
+  s.advanceOnResume = false;
+  s.loadingIndex = null;
+}
+
 function finishSession(s) {
   if (!isActive(s)) return;
   s.stopped = true;
+  clearPauseState(s);
   logEvent('session-end', { sessionId: s.sessionId, reason: 'finished' });
   clearStallTimer(s);
   clearPageHighlight(s);
@@ -772,19 +972,22 @@ function stopSession(reason) {
   if (!s) return;
   if (!s.stopped) logEvent('session-end', { sessionId: s.sessionId, reason });
   s.stopped = true;
+  clearPauseState(s); // a Stop (or replacement) ends a pause and drops any held chunk
   clearStallTimer(s);
   for (const controller of s.abortControllers.values()) {
     controller.abort();
   }
   s.abortControllers.clear();
   s.prefetch = null;
-  broadcast({ type: 'stop' });
+  // Carries the id so the offscreen document tears down only this session's
+  // audio, and a late Stop for a replaced session cannot hit the new one.
+  broadcast({ type: 'stop', sessionId: s.sessionId });
   clearPageHighlight(s);
   finalizeRecording(s);
   clearKeepAliveIfIdle();
   if (session === s) {
     currentPlayerState = 'stopped';
-    broadcast({ type: 'playerStateUpdate', state: 'stopped' });
+    broadcast({ type: 'playerStateUpdate', state: 'stopped', sessionId: null });
   }
 }
 
@@ -801,9 +1004,12 @@ function finalizeRecording(s) {
   }
 }
 
+// The popup enables Pause during starting/loading only once a session exists,
+// so every state update says which session (if any) is live.
 function setPlayerState(state) {
   currentPlayerState = state;
-  broadcast({ type: 'playerStateUpdate', state });
+  const live = session && !session.stopped ? session.sessionId : null;
+  broadcast({ type: 'playerStateUpdate', state, sessionId: live });
 }
 
 function broadcastError(message) {

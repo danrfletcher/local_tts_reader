@@ -1,5 +1,19 @@
 let audioPlayer = null;
 let currentAudioUrl = null;
+// Id of the background's live reading session, or null. Kept from the state
+// updates the background broadcasts and from getSessionState when the popup
+// opens; Pause is only offered during starting/loading once one exists.
+let activeSessionId = null;
+
+// Play resumes a paused session, starts a new one only when there is no live
+// session (never started, stopped, or finished), and does nothing for a live
+// session that is not paused (it is already reading or about to). The choice
+// comes from the background's flags (getSessionState), never from the player
+// state, which is only what the popup last heard.
+function playButtonAction(sessionState) {
+  if (!sessionState || !sessionState.active) return 'new';
+  return sessionState.paused ? 'resume' : 'none';
+}
 
 function updateSentenceProgress(info) {
   const el = document.getElementById('sentenceProgress');
@@ -59,7 +73,7 @@ async function clearDebugLog() {
   }
 }
 
-function updateControlButtons(state) {
+function updateControlButtons(state, sessionActive = activeSessionId !== null) {
   const playBtn = document.getElementById('playBtn');
   const pauseBtn = document.getElementById('pauseBtn');
   const stopBtn = document.getElementById('stopBtn');
@@ -77,7 +91,7 @@ function updateControlButtons(state) {
   switch(state) {
     case 'starting':
       playBtn.disabled = true;
-      pauseBtn.disabled = true;
+      pauseBtn.disabled = !sessionActive;
       downloadBtn.disabled = true;
       seekBar.disabled = true;
       loadingLabel.textContent = 'Starting voice engine…';
@@ -85,14 +99,16 @@ function updateControlButtons(state) {
       break;
     case 'loading':
       playBtn.disabled = true;
-      pauseBtn.disabled = true;
+      pauseBtn.disabled = !sessionActive;
       downloadBtn.disabled = true;
       seekBar.disabled = true;
       loadingLabel.textContent = 'Loading…';
       loadingIndicator.style.display = 'flex';
       break;
     case 'ready':
-      playBtn.disabled = false;
+      // With a live session 'ready' is the gap between a sentence being
+      // fetched and its audio starting; Play there would have nothing to do.
+      playBtn.disabled = sessionActive;
       pauseBtn.disabled = true;
       downloadBtn.disabled = !currentAudioUrl;
       seekBar.disabled = false;
@@ -155,8 +171,16 @@ function formatTime(seconds) {
 // Sync player state when popup opens
 async function syncPlayerState() {
   if (audioPlayer) {
-    const state = await audioPlayer.getState();
-    updateControlButtons(state);
+    // The background says whether the session is paused; a paused session
+    // shows Play enabled, Pause disabled and its sentence.
+    const info = await audioPlayer.getSessionState();
+    activeSessionId = info.active ? info.sessionId : null;
+    if (info.active && info.paused) {
+      updateControlButtons('paused');
+    } else {
+      updateControlButtons(await audioPlayer.getState());
+    }
+    if (info.active) updateSentenceProgress(info);
     
     // Also sync the seek bar
     const timeInfo = await audioPlayer.getTimeInfo();
@@ -224,7 +248,7 @@ document.addEventListener('DOMContentLoaded', async function() {
   });
   
   // Sync player state
-  syncPlayerState();
+  syncPlayerState().catch((error) => console.error('Error syncing player state:', error));
   
   // Start seek bar updates
   let updateInterval = startSeekBarUpdates();
@@ -257,10 +281,13 @@ document.addEventListener('DOMContentLoaded', async function() {
   // Play button
   document.getElementById('playBtn').addEventListener('click', async function() {
     try {
-      const state = await audioPlayer.getState();
-      
-      if (state === 'paused' || state === 'ready') {
-        audioPlayer.resume();
+      const sessionState = await audioPlayer.getSessionState();
+      const action = playButtonAction(sessionState);
+
+      if (action === 'none') return; // live, unpaused session: never replace it
+
+      if (action === 'resume') {
+        audioPlayer.resume(sessionState.sessionId);
         updateControlButtons('playing');
         
         // Restart seek bar updates
@@ -288,14 +315,18 @@ document.addEventListener('DOMContentLoaded', async function() {
   });
   
   // Pause button
-  document.getElementById('pauseBtn').addEventListener('click', function() {
-    audioPlayer.pause();
+  document.getElementById('pauseBtn').addEventListener('click', async function() {
+    const sessionState = await audioPlayer.getSessionState();
+    if (!sessionState.active) return; // nothing to pause
+    audioPlayer.pause(sessionState.sessionId);
     updateControlButtons('paused');
   });
   
   // Stop button
-  document.getElementById('stopBtn').addEventListener('click', function() {
-    audioPlayer.stop();
+  document.getElementById('stopBtn').addEventListener('click', async function() {
+    const sessionState = await audioPlayer.getSessionState();
+    // No live session: an id-less Stop still tears down any stray audio.
+    audioPlayer.stop(sessionState.active ? sessionState.sessionId : undefined);
     updateControlButtons('stopped');
     if (updateInterval) {
       clearInterval(updateInterval);
@@ -325,6 +356,7 @@ document.addEventListener('DOMContentLoaded', async function() {
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
       case 'playerStateUpdate':
+        activeSessionId = message.sessionId || null;
         updateControlButtons(message.state);
         if (message.state === 'playing' && !updateInterval) {
           updateInterval = startSeekBarUpdates();

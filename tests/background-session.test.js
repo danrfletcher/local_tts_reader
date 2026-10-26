@@ -854,11 +854,11 @@ test('E10: a timer left from a replaced session never advances the new one', asy
   assert.equal(eventsOf(await downloadLog(bg), 'stall').length, 1, 'one stall, belonging to the new session');
 });
 
-test('E10: the stall timer honours a paused flag (helper wiring only; Pause itself is not routed here)', async () => {
+test('E10: the stall timer honours a paused flag set directly on the session', async () => {
   const bg = loadBackground({ sentences: SENTENCES });
   await startRead(bg);
   const s = liveSession(bg);
-  s.paused = true; // what a later change will set on Pause
+  s.paused = true; // what Pause sets (tests/background-pause.test.js drives Pause itself)
   const chunk0 = playChunks(bg)[0];
   await bg.send({ type: 'audioDuration', sessionId: chunk0.sessionId, index: 0, playNumber: 1, duration: 5 });
   assert.equal(bg.timers.pending, 0, 'no deadline while paused');

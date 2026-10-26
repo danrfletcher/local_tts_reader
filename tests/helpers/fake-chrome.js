@@ -147,6 +147,7 @@ function createFakeChrome(options = {}) {
     : [];
   const createdOffscreen = [];
   const contextMenusCreated = [];
+  let rejectMessage = null; // (message) => boolean: nobody is listening for it
 
   const chrome = {
     storage: { local: createStorageArea(localStorage), session: createStorageArea(sessionStorage) },
@@ -156,6 +157,10 @@ function createFakeChrome(options = {}) {
       getURL: (p) => `chrome-extension://${extensionId}/${String(p).replace(/^\.\//, '')}`,
       sendMessage(message, callback) {
         sent.push(clone(message));
+        if (rejectMessage && rejectMessage(message)) {
+          // As Chrome does when the receiving page (e.g. the offscreen document) is gone.
+          return Promise.reject(new Error('Could not establish connection. Receiving end does not exist.'));
+        }
         if (typeof callback === 'function') {
           callback(undefined);
           return undefined;
@@ -220,6 +225,10 @@ function createFakeChrome(options = {}) {
     listeners,
     closeOffscreen() {
       offscreenContexts = [];
+    },
+    /** Make runtime.sendMessage reject for messages matching `predicate` (null to stop). */
+    rejectMessages(predicate) {
+      rejectMessage = predicate;
     },
     /**
      * Deliver a runtime message to the extension's listeners. Resolves with

@@ -63,6 +63,12 @@ function seekTo(time) {
   audioElement.currentTime = time;
 }
 
+// Does a control message (play, pause) name the session that owns the audio
+// element right now?
+function isCurrentSession(message) {
+  return message.sessionId != null && message.sessionId === currentSessionId;
+}
+
 // Handle messages from the background script
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   switch (message.type) {
@@ -81,18 +87,38 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
       break;
 
+    // Play and Pause come from the background, which owns the paused flag, and
+    // carry the session id. One that does not name the session on the audio
+    // element (a late message from a replaced session) is ignored.
     case 'play':
-      audioElement.play();
+      if (!isCurrentSession(message)) {
+        console.warn('[TTS Reader] Ignoring play for another session.');
+        break;
+      }
+      audioElement.play().catch((err) => console.warn('Resume error:', err));
       break;
 
     case 'pause':
+      if (!isCurrentSession(message)) {
+        console.warn('[TTS Reader] Ignoring pause for another session.');
+        break;
+      }
       audioElement.pause();
       break;
 
-    case 'stop':
+    case 'stop': {
+      // A Stop for a replaced session must not tear down the audio of the
+      // session that replaced it. A Stop with no id, or one arriving when
+      // nothing is loaded, always tears down.
+      if (message.sessionId != null && currentSessionId !== null && message.sessionId !== currentSessionId) {
+        console.warn('[TTS Reader] Ignoring stop for another session.');
+        break;
+      }
+      const stoppedSessionId = message.sessionId ?? currentSessionId;
       // Whatever session was playing is over: a playChunk for it that is
       // still on its way must not start anything.
       playLedger.retire(playLedger.current);
+      if (message.sessionId != null) playLedger.retire(message.sessionId);
       currentChunkIndex = null;
       currentSessionId = null;
       currentPlayNumber = null;
@@ -104,8 +130,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         URL.revokeObjectURL(previousObjectUrl);
         previousObjectUrl = null;
       }
-      chrome.runtime.sendMessage({ type: 'stateUpdate', state: 'stopped' });
+      chrome.runtime.sendMessage({ type: 'stateUpdate', state: 'stopped', sessionId: stoppedSessionId });
       break;
+    }
 
     case 'seek': {
       seekTo(message.time);
@@ -118,18 +145,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 // Initialize audio event handlers
+// Tagged with the session id so the background can drop a report from a
+// replaced session.
 audioElement.onplay = () => {
-  chrome.runtime.sendMessage({ type: 'stateUpdate', state: 'playing' });
+  chrome.runtime.sendMessage({ type: 'stateUpdate', state: 'playing', sessionId: currentSessionId });
 };
 
-audioElement.onpause = () => {
-  // Swapping `src` between chunks, or the explicit Stop handler above,
-  // both leave currentTime at/near 0 without the user asking to pause —
-  // only report a genuine user pause.
-  if (!audioElement.ended && audioElement.currentTime > 0) {
-    chrome.runtime.sendMessage({ type: 'stateUpdate', state: 'paused' });
-  }
-};
+// There is deliberately no onpause report: Pause goes popup -> background,
+// which records `paused` itself and then tells this document to pause. An
+// element that pauses on its own (a `src` swap, Stop) is not a user Pause.
 
 // The duration is known once the metadata has loaded. background.js uses it
 // for the stall timeout. NaN and Infinity cross the message boundary as null

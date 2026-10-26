@@ -19,14 +19,28 @@ function loadOffscreen({ audioCount = 1, onMessageToBackground = null } = {}) {
     duration: NaN,
     ended: false,
     plays: [],
+    pauses: 0,
+    loads: 0,
+    removedAttributes: [],
     play() {
       this.plays.push(this.src);
       return Promise.resolve();
     },
-    pause() {},
-    load() {},
-    removeAttribute() {}
+    pause() {
+      this.pauses++;
+      // A real element fires `pause` whenever it pauses, whoever asked.
+      if (typeof this.onpause === 'function') this.onpause();
+    },
+    load() {
+      this.loads++;
+    },
+    removeAttribute(name) {
+      this.removedAttributes.push(name);
+      if (name === 'src') this.src = '';
+    }
   };
+  const created = [];
+  const revoked = [];
   const document = {
     getElementById: (id) => (id === 'audioElement' ? audio : null),
     querySelectorAll: (selector) => (selector === 'audio' ? Array.from({ length: audioCount }, () => audio) : [])
@@ -36,8 +50,8 @@ function loadOffscreen({ audioCount = 1, onMessageToBackground = null } = {}) {
     Blob,
     Uint8Array,
     URL: {
-      createObjectURL: (() => { let n = 0; return () => `blob:fake-${++n}`; })(),
-      revokeObjectURL() {}
+      createObjectURL: (() => { let n = 0; return () => { const url = `blob:fake-${++n}`; created.push(url); return url; }; })(),
+      revokeObjectURL: (url) => { revoked.push(url); }
     },
     console: { ...console, warn() {} },
     chrome: {
@@ -61,6 +75,8 @@ function loadOffscreen({ audioCount = 1, onMessageToBackground = null } = {}) {
   return {
     audio,
     sent,
+    created,
+    revoked,
     deliver(message) {
       for (const l of listeners) l(JSON.parse(JSON.stringify(message)), {}, () => {});
     }

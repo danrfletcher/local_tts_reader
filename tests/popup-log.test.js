@@ -73,6 +73,7 @@ function loadPopup({ sendMessage, playerInitFails = false } = {}) {
     AudioPlayer: class {
       async init() { if (playerInitFails) throw new Error('player init failed'); }
       async getState() { return 'stopped'; }
+      async getSessionState() { return { active: false, sessionId: null, paused: false, index: 0, total: 0 }; }
       async getTimeInfo() { return null; }
     },
     DEFAULT_SETTINGS: { serverUrl: 'x', voice: 'v', speed: 1, recordAudio: false, preprocessText: true },

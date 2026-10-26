@@ -34,29 +34,42 @@ class AudioPlayer {
       }
     }
   
-    pause() {
+    // Pause, Play (resume) and Stop all go to background.js, which owns the
+    // session and its paused flag; none is sent to the offscreen document
+    // from here. Each names the session it means (from getSessionState), so
+    // a message for a session that has since been replaced does nothing.
+    // Stop without an id is an unconditional Stop.
+    pause(sessionId) {
       if (this.isInitialized) {
-        chrome.runtime.sendMessage({ type: 'pause' });
+        chrome.runtime.sendMessage({ type: 'controlAudio', action: 'pause', sessionId });
         this.isPlaying = false;
       }
     }
   
-    resume() {
+    resume(sessionId) {
       if (this.isInitialized) {
-        chrome.runtime.sendMessage({ type: 'play' });
+        chrome.runtime.sendMessage({ type: 'controlAudio', action: 'play', sessionId });
         this.isPlaying = true;
       }
     }
   
-    stop() {
+    stop(sessionId) {
       if (this.isInitialized) {
-        // Routed through background.js (not sent to the offscreen
-        // document directly) so it can abort any in-flight/prefetch
-        // fetch and clear the remaining sentence queue, not just halt
+        // Lets background.js abort any in-flight/prefetch fetch, drop a
+        // held chunk and clear the remaining sentence queue, not just halt
         // whatever's currently playing.
-        chrome.runtime.sendMessage({ type: 'stopSession' });
+        chrome.runtime.sendMessage({ type: 'controlAudio', action: 'stop', sessionId });
         this.isPlaying = false;
       }
+    }
+
+    // { active, sessionId, paused, index, total } from the background.
+    async getSessionState() {
+      return new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: 'getSessionState' }, (response) => {
+          resolve(response || { active: false, sessionId: null, paused: false, index: 0, total: 0 });
+        });
+      });
     }
   
     async seek(time) {
@@ -73,7 +86,7 @@ class AudioPlayer {
     async getState() {
       return new Promise((resolve) => {
         chrome.runtime.sendMessage({ type: 'getPlayerState' }, (response) => {
-          resolve(response.state || 'stopped');
+          resolve((response && response.state) || 'stopped');
         });
       });
     }
@@ -81,7 +94,9 @@ class AudioPlayer {
     async getTimeInfo() {
       return new Promise((resolve) => {
         chrome.runtime.sendMessage({ type: 'getTimeInfo' }, (response) => {
-          resolve(response.timeInfo || null);
+          // No response when the offscreen document is not running (Chrome
+          // closes it after 30 s without audio, e.g. while paused).
+          resolve((response && response.timeInfo) || null);
         });
       });
     }
