@@ -6,6 +6,15 @@ let currentSessionId = null;
 let currentPlayNumber = null;
 let previousObjectUrl = null;
 
+// Accepts each (session id, index, play number) once, so a duplicated
+// playChunk cannot set `src` and call play() a second time, and a playChunk
+// from a replaced or stopped session never reaches the <audio> element.
+const playLedger = TTSPlayback.createPlayLedger();
+
+function reportDroppedPlay(sessionId, index, playNumber, reason) {
+  chrome.runtime.sendMessage({ type: 'playDropped', sessionId, index, playNumber, reason }).catch(() => {});
+}
+
 // Play one prefetched sentence chunk. background.js is responsible for
 // ordering/prefetching; this just plays whatever it's told to, in order.
 function playChunk(audioDataArray, mimeType, index, sessionId, playNumber) {
@@ -59,6 +68,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   switch (message.type) {
     case 'playChunk':
       if (message.audioData) {
+        // Messages from a background that sends no ids are played as before.
+        if (message.sessionId != null) {
+          const verdict = playLedger.accept(message.sessionId, message.index, message.playNumber, { adopt: true });
+          if (!verdict.ok) {
+            console.warn(`[TTS Reader] Ignoring playChunk ${message.index} (${verdict.reason}).`);
+            reportDroppedPlay(message.sessionId, message.index, message.playNumber, verdict.reason);
+            break;
+          }
+        }
         playChunk(message.audioData, message.mimeType, message.index, message.sessionId, message.playNumber);
       }
       break;
@@ -72,6 +90,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       break;
 
     case 'stop':
+      // Whatever session was playing is over: a playChunk for it that is
+      // still on its way must not start anything.
+      playLedger.retire(playLedger.current);
       currentChunkIndex = null;
       currentSessionId = null;
       currentPlayNumber = null;
@@ -108,6 +129,20 @@ audioElement.onpause = () => {
   if (!audioElement.ended && audioElement.currentTime > 0) {
     chrome.runtime.sendMessage({ type: 'stateUpdate', state: 'paused' });
   }
+};
+
+// The duration is known once the metadata has loaded. background.js uses it
+// for the stall timeout. NaN and Infinity cross the message boundary as null
+// and are ignored there.
+audioElement.onloadedmetadata = () => {
+  if (currentChunkIndex === null) return;
+  chrome.runtime.sendMessage({
+    type: 'audioDuration',
+    sessionId: currentSessionId,
+    index: currentChunkIndex,
+    playNumber: currentPlayNumber,
+    duration: audioElement.duration
+  }).catch(() => {});
 };
 
 // A chunk finishing playback means "advance the queue", not "session

@@ -123,19 +123,21 @@ test('a timeout retry is counted as two fetches', async () => {
   assert.equal(playChunks(bg).length, 1, 'the retry still plays once');
 });
 
-test('a 20 s watchdog advance is logged and the next sentence plays', async () => {
+test('a stall advance (60 s, duration unknown) is logged and the next sentence plays', async () => {
   const bg = loadBackground({ sentences: SENTENCES });
   await startRead(bg);
   assert.equal(playChunks(bg).length, 1);
   await bg.timers.tick(20000);
+  assert.equal(playChunks(bg).length, 1, 'the old fixed 20 s watchdog is gone');
+  await bg.timers.tick(40000);
 
   const log = await downloadLog(bg);
-  const watchdog = eventsOf(log, 'watchdog');
-  assert.equal(watchdog.length, 1);
-  assert.equal(watchdog[0].index, 0);
-  assert.equal(watchdog[0].playNumber, 1);
-  assert.equal(watchdog[0].ms, 20000);
-  assert.equal(watchdog[0].sessionId, playChunks(bg)[0].sessionId);
+  const stalls = eventsOf(log, 'stall');
+  assert.equal(stalls.length, 1);
+  assert.equal(stalls[0].index, 0);
+  assert.equal(stalls[0].playNumber, 1);
+  assert.equal(stalls[0].ms, 60000);
+  assert.equal(stalls[0].sessionId, playChunks(bg)[0].sessionId);
   assert.deepEqual(playChunks(bg).map((m) => m.index), [0, 1]);
 });
 

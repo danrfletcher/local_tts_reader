@@ -139,6 +139,12 @@ test('F6: no bundler or TypeScript config exists', () => {
   assert.deepEqual(entries.filter((name) => banned.test(name)), []);
 });
 
+test('F6: offscreen.html loads lib/playback.js (a classic script) before offscreen.js, with no module scripts', () => {
+  const html = read('offscreen.html');
+  const scripts = [...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]);
+  assert.deepEqual(scripts, ['<script src="lib/playback.js">', '<script src="offscreen.js">']);
+});
+
 // --- F7: no sentence slider -------------------------------------------------------------------------
 
 test('F7: popup.html range inputs are still only speed and seekBar', () => {

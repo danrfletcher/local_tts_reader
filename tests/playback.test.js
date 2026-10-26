@@ -12,6 +12,11 @@ const { createStorageArea, settle, ROOT } = require('./helpers/fake-chrome.js');
 const {
   mintSessionId,
   createPlayCounter,
+  createStartTokens,
+  createPlayLedger,
+  staleReason,
+  isUsableDuration,
+  stallTimeoutMs,
   sanitizeError,
   sha256Prefix,
   buildEvent,
@@ -342,4 +347,185 @@ test('summariseLog: one row per session, index and play number', () => {
 test('summariseLog: empty and missing input give no rows', () => {
   assert.deepEqual(summariseLog([]), []);
   assert.deepEqual(summariseLog(undefined), []);
+});
+
+// --- F6: the pure module has no chrome or DOM ------------------------------------------------
+
+test('F6: lib/playback.js loads in node with no chrome global and mentions no chrome.* or DOM', () => {
+  assert.equal(typeof chrome, 'undefined');
+  const sandbox = {};
+  sandbox.self = sandbox; // a worker-like global, but with no `chrome`, `document` or `window`
+  vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(ROOT, 'lib', 'playback.js'), 'utf8'), sandbox);
+  assert.equal(typeof sandbox.TTSPlayback.createPlayLedger, 'function');
+  assert.equal(typeof sandbox.TTSPlayback.stallTimeoutMs, 'function');
+
+  const code = fs.readFileSync(path.join(ROOT, 'lib', 'playback.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(!/\bchrome\b|\bdocument\b|\bwindow\b|\bnavigator\b/.test(code));
+});
+
+// --- E8: start tokens -------------------------------------------------------------------------
+
+test('E8: the latest start token wins; earlier ones are superseded whatever order they finish in', () => {
+  const tokens = createStartTokens();
+  const first = tokens.next();
+  assert.equal(tokens.isCurrent(first), true);
+  const second = tokens.next();
+  assert.notEqual(first, second);
+  assert.equal(tokens.isCurrent(first), false, 'the earlier start is superseded');
+  assert.equal(tokens.isCurrent(second), true);
+  const third = tokens.next();
+  assert.deepEqual([first, second, third].map((t) => tokens.isCurrent(t)), [false, false, true]);
+});
+
+test('E8: separate token sources do not affect each other, and a made-up token is never current', () => {
+  const a = createStartTokens();
+  const b = createStartTokens();
+  const t = a.next();
+  b.next();
+  b.next();
+  assert.equal(a.isCurrent(t), true);
+  assert.equal(a.isCurrent(undefined), false);
+  assert.equal(a.isCurrent(t + 1), false);
+});
+
+// --- E8 / E9: the play ledger ---------------------------------------------------------------------
+
+test('E9: the ledger accepts each (session id, index, play number) once', () => {
+  const ledger = createPlayLedger();
+  ledger.begin('aaaaaa');
+  assert.deepEqual(ledger.accept('aaaaaa', 0, 1), { ok: true });
+  assert.deepEqual(ledger.accept('aaaaaa', 0, 1), { ok: false, reason: 'duplicate' });
+  assert.deepEqual(ledger.accept('aaaaaa', 0, 1), { ok: false, reason: 'duplicate' }, 'still a duplicate the third time');
+  assert.deepEqual(ledger.accept('aaaaaa', 1, 1), { ok: true }, 'another index is a new triple');
+});
+
+test('E9: a new play number for the same sentence is a new attempt; an older one is rejected', () => {
+  const ledger = createPlayLedger();
+  ledger.begin('aaaaaa');
+  assert.equal(ledger.accept('aaaaaa', 3, 1).ok, true);
+  assert.equal(ledger.accept('aaaaaa', 3, 2).ok, true, 'a replay');
+  assert.deepEqual(ledger.accept('aaaaaa', 3, 1), { ok: false, reason: 'duplicate' });
+  const ledger2 = createPlayLedger();
+  ledger2.begin('aaaaaa');
+  ledger2.accept('aaaaaa', 3, 2);
+  assert.deepEqual(ledger2.accept('aaaaaa', 3, 1), { ok: false, reason: 'stale-play' }, '1 was never accepted but 2 already was');
+  assert.equal(ledger2.accept('aaaaaa', 4, 1).ok, true, 'play numbers are per sentence');
+});
+
+test('E8: the ledger rejects other and replaced session ids', () => {
+  const ledger = createPlayLedger();
+  assert.deepEqual(ledger.accept('aaaaaa', 0, 1), { ok: false, reason: 'stale-session' }, 'no live session yet');
+  ledger.begin('aaaaaa');
+  assert.equal(ledger.accept('aaaaaa', 0, 1).ok, true);
+  assert.deepEqual(ledger.accept('bbbbbb', 0, 1), { ok: false, reason: 'stale-session' }, 'not the live session');
+  ledger.begin('bbbbbb');
+  assert.equal(ledger.current, 'bbbbbb');
+  assert.deepEqual(ledger.accept('aaaaaa', 1, 1), { ok: false, reason: 'stale-session' }, 'replaced');
+  assert.equal(ledger.accept('bbbbbb', 0, 1).ok, true, 'the new session starts with an empty ledger');
+  assert.equal(ledger.begin('aaaaaa'), false, 'a retired id cannot come back');
+  assert.equal(ledger.current, 'bbbbbb');
+});
+
+test('E8: retire() ends the live session for good', () => {
+  const ledger = createPlayLedger();
+  ledger.begin('aaaaaa');
+  ledger.retire('aaaaaa');
+  assert.equal(ledger.current, null);
+  assert.deepEqual(ledger.accept('aaaaaa', 0, 1), { ok: false, reason: 'stale-session' });
+  assert.deepEqual(ledger.accept('aaaaaa', 0, 1, { adopt: true }), { ok: false, reason: 'stale-session' }, 'adopt cannot revive it');
+  ledger.retire(null); // harmless
+  ledger.retire(undefined);
+});
+
+test('E9: adopt lets a receiver learn the live session from its first message', () => {
+  const ledger = createPlayLedger();
+  assert.equal(ledger.accept('aaaaaa', 0, 1, { adopt: true }).ok, true);
+  assert.equal(ledger.current, 'aaaaaa');
+  assert.deepEqual(ledger.accept('aaaaaa', 0, 1, { adopt: true }), { ok: false, reason: 'duplicate' });
+  assert.equal(ledger.accept('bbbbbb', 0, 1, { adopt: true }).ok, true, 'a newer session replaces it');
+  assert.deepEqual(ledger.accept('aaaaaa', 1, 1, { adopt: true }), { ok: false, reason: 'stale-session' }, 'and the old one is retired');
+});
+
+test('E9: malformed ids are rejected as invalid', () => {
+  const ledger = createPlayLedger();
+  ledger.begin('aaaaaa');
+  for (const args of [
+    [undefined, 0, 1], [null, 0, 1], [7, 0, 1],
+    ['aaaaaa', -1, 1], ['aaaaaa', 1.5, 1], ['aaaaaa', '0', 1], ['aaaaaa', NaN, 1], ['aaaaaa', undefined, 1],
+    ['aaaaaa', 0, 0], ['aaaaaa', 0, -2], ['aaaaaa', 0, 1.5], ['aaaaaa', 0, null], ['aaaaaa', 0, undefined]
+  ]) {
+    assert.deepEqual(ledger.accept(...args), { ok: false, reason: 'invalid' }, JSON.stringify(args));
+  }
+  assert.equal(ledger.accept('aaaaaa', 0, 1).ok, true, 'rejected input left the ledger untouched');
+});
+
+test('the ledger remembers only a bounded number of retired sessions', () => {
+  const ledger = createPlayLedger();
+  for (let i = 0; i < 120; i++) ledger.begin(`s${String(i).padStart(5, '0')}`);
+  assert.equal(ledger.current, 's00119');
+  assert.equal(ledger.accept('s00118', 0, 1).ok, false, 'a recent one is still known to be stale');
+  assert.equal(ledger.accept('s00000', 0, 1).reason, 'stale-session', 'an ancient one is stale too: it is not the live session');
+});
+
+test('staleReason: names which part of a message does not match the live sentence', () => {
+  const live = { sessionId: 'aaaaaa', index: 2, playNumber: 1 };
+  assert.equal(staleReason(live, { sessionId: 'aaaaaa', index: 2, playNumber: 1 }), null);
+  assert.equal(staleReason(null, { sessionId: 'aaaaaa', index: 2, playNumber: 1 }), 'no-session');
+  assert.equal(staleReason(live, { sessionId: 'bbbbbb', index: 2, playNumber: 1 }), 'stale-session');
+  assert.equal(staleReason(live, { index: 2, playNumber: 1 }), 'stale-session');
+  assert.equal(staleReason(live, undefined), 'stale-session');
+  assert.equal(staleReason(live, { sessionId: 'aaaaaa', index: 1, playNumber: 1 }), 'stale-index');
+  assert.equal(staleReason(live, { sessionId: 'aaaaaa', index: 2, playNumber: 2 }), 'stale-play', 'newer play number');
+  assert.equal(staleReason({ ...live, playNumber: 2 }, { sessionId: 'aaaaaa', index: 2, playNumber: 1 }), 'stale-play', 'older play number');
+  assert.equal(staleReason(live, { sessionId: 'aaaaaa', index: 2 }), 'stale-play');
+});
+
+// --- E10: stall timeout ------------------------------------------------------------------------------
+
+test('E10: stallTimeoutMs table: duration + 5 s when known, 60 s when not, none while paused', () => {
+  const table = [
+    ['duration known, 2 s', { durationSec: 2 }, 7000],
+    ['duration known, 0.25x speed, 40 s sentence', { durationSec: 40 }, 45000],
+    ['duration known, fractional', { durationSec: 1.2345 }, 6235],
+    ['duration known, very short', { durationSec: 0.001 }, 5001],
+    ['duration unknown (undefined)', { durationSec: undefined }, 60000],
+    ['duration unknown (no argument object fields)', {}, 60000],
+    ['NaN', { durationSec: NaN }, 60000],
+    ['null (NaN after JSON)', { durationSec: null }, 60000],
+    ['zero', { durationSec: 0 }, 60000],
+    ['negative', { durationSec: -3 }, 60000],
+    ['Infinity', { durationSec: Infinity }, 60000],
+    ['a string', { durationSec: '40' }, 60000],
+    ['paused, duration known', { durationSec: 40, paused: true }, null],
+    ['paused, duration unknown', { durationSec: NaN, paused: true }, null],
+    ['paused false is not paused', { durationSec: 40, paused: false }, 45000]
+  ];
+  for (const [name, args, expected] of table) {
+    assert.equal(stallTimeoutMs(args), expected, name);
+  }
+  assert.equal(stallTimeoutMs(), 60000, 'no argument at all');
+  assert.equal(TTSPlayback.STALL_GRACE_MS, 5000);
+  assert.equal(TTSPlayback.HANG_TIMEOUT_MS, 60000);
+});
+
+test('E10: isUsableDuration accepts only finite numbers above zero', () => {
+  for (const good of [0.001, 1, 40, 3600]) assert.equal(isUsableDuration(good), true, String(good));
+  for (const bad of [0, -1, NaN, Infinity, -Infinity, null, undefined, '5', {}, [], true]) {
+    assert.equal(isUsableDuration(bad), false, String(bad));
+  }
+});
+
+test('summariseLog: dropped messages, stalls and durations do not add rows for ids that never played', () => {
+  const rows = summariseLog([
+    { t: 1, type: 'session-start', sessionId: 'aaaaaa', extensionId: 'x', version: '1.0' },
+    { t: 2, type: 'play', sessionId: 'aaaaaa', index: 0, playNumber: 1 },
+    { t: 3, type: 'dropped-chunk-ended', sessionId: 'aaaaaa', index: 0, playNumber: 7, reason: 'stale-play' },
+    { t: 4, type: 'dropped-chunk-ended', sessionId: 'bbbbbb', index: 0, playNumber: 1, reason: 'stale-session' },
+    { t: 5, type: 'stall', sessionId: 'aaaaaa', index: 0, playNumber: 1, ms: 60000 },
+    { t: 6, type: 'audio-duration', sessionId: 'aaaaaa', index: 0, playNumber: 1, ms: 4000 }
+  ]);
+  assert.deepEqual(rows.map((r) => [r.sessionId, r.index, r.playNumber]), [['aaaaaa', 0, 1]]);
 });

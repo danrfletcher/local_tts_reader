@@ -8,6 +8,12 @@ let creating = null; // A global promise to avoid concurrency issues
 // Only one session is active at a time.
 let session = null;
 
+// Every request to start reading takes a token the moment it arrives, before
+// any await. A start whose token is no longer the latest has been superseded
+// and returns without touching `session`, so overlapping starts (popup Play
+// plus the context menu, or Play pressed twice) leave exactly one session.
+const startTokens = TTSPlayback.createStartTokens();
+
 // --- Always-on debug log -----------------------------------------------
 // Appended to only from this file; lives in chrome.storage.local under
 // 'ttsDebugLog'. Events are built from an allowlist (lib/playback.js), so
@@ -44,9 +50,15 @@ const MIN_READABLE_FRAME_LENGTH = 200;
 const FRAME_PREFERENCE_MARGIN = 200;
 
 function newSession(tabId, frameId, settings, isRecording, sessionId) {
-  return {
+  const s = {
     sessionId, // minted here; separate from the content script's numeric id
     playCounter: TTSPlayback.createPlayCounter(),
+    // Play number of the sentence handed to the audio element right now.
+    currentPlayNumber: null,
+    // Accepts each (session id, index, play number) of chunkEnded once.
+    endedLedger: TTSPlayback.createPlayLedger(),
+    playEnded: false, // the current play has been accepted as ended (or stalled)
+    durationKnown: false, // the offscreen document reported this play's duration
     tabId,
     frameId,
     settings,
@@ -57,9 +69,15 @@ function newSession(tabId, frameId, settings, isRecording, sessionId) {
     prefetch: null, // { index, promise } | { index, result: {arrayBuffer, mimeType} }
     abortControllers: new Map(), // index -> AbortController
     recordedChunks: [], // in order, for recordAudio
-    chunkWatchdogTimer: null,
+    stallTimer: null,
+    // Token of the start request that made this session. A later token means
+    // this start was superseded; playFromIndex re-checks it for every
+    // sentence, see supersededBeforePlay.
+    startToken: null,
     stopped: false
   };
+  s.endedLedger.begin(sessionId);
+  return s;
 }
 
 function isActive(s) {
@@ -116,6 +134,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 // page when there's no active selection, so 'selection' mode covers
 // both "text selected" and "nothing selected -> read the page" cases.
 async function startReadingFromTab(tabId, frameId) {
+  const token = startTokens.next();
   try {
     const settings = await chrome.storage.local.get({
       serverUrl: 'http://localhost:8000/v1/audio/speech',
@@ -124,10 +143,14 @@ async function startReadingFromTab(tabId, frameId) {
       recordAudio: false,
       preprocessText: true
     });
-    await beginSession(tabId, settings, settings.recordAudio, 'selection', frameId);
+    if (!startTokens.isCurrent(token)) {
+      logSupersededStart('queued');
+      return;
+    }
+    await beginSession(tabId, settings, settings.recordAudio, 'selection', frameId, token);
   } catch (error) {
     console.error('Error starting reading from tab:', error);
-    broadcastError(error.message);
+    if (startTokens.isCurrent(token)) broadcastError(error.message);
   }
 }
 
@@ -139,10 +162,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
 
     case 'startStreaming': {
+      const token = startTokens.next();
       (async () => {
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
         const tabId = tabs[0]?.id ?? null;
-        await beginSession(tabId, message.settings, message.record, message.mode || 'selection');
+        if (!startTokens.isCurrent(token)) {
+          logSupersededStart('queued');
+          sendResponse({ success: true, superseded: true });
+          return;
+        }
+        await beginSession(tabId, message.settings, message.record, message.mode || 'selection', undefined, token);
         sendResponse({ success: true });
       })();
       return true;
@@ -164,6 +193,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     case 'audioReady':
       logEvent('audio-ready', { ...messageIds(message), audioElements: message.audioElements });
+      // A late audioReady from a replaced session must not flip the state of
+      // the session that replaced it.
+      if (!session || session.stopped || message.sessionId !== session.sessionId) return true;
       if (currentPlayerState === 'loading' || currentPlayerState === 'starting') {
         currentPlayerState = 'ready';
         broadcast({ type: 'playerStateUpdate', state: 'ready' });
@@ -172,11 +204,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     case 'chunkEnded':
       logEvent('chunk-ended', messageIds(message));
-      handleChunkEnded(message.index).catch((error) => {
+      handleChunkEnded(message).catch((error) => {
         console.error('Error handling chunk end:', error);
         broadcastError(error.message);
         stopSession('error');
       });
+      return true;
+
+    case 'audioDuration':
+      handleAudioDuration(message);
+      return true;
+
+    case 'playDropped':
+      // The offscreen document refused a playChunk (duplicate or from a
+      // replaced session). Only the background writes the log, so it records
+      // the drop on the offscreen document's behalf.
+      logEvent('dropped-play-chunk', { ...messageIds(message), reason: message.reason });
       return true;
 
     case 'getPlayerState':
@@ -253,7 +296,15 @@ function handleControlAudio(action) {
 
 // --- Session lifecycle ---------------------------------------------------
 
-async function beginSession(tabId, settings, isRecording, mode, frameId) {
+function logSupersededStart(stage, sessionId) {
+  logEvent('start-superseded', { sessionId, outcome: stage });
+}
+
+// `token` comes from startTokens.next() and is taken when the start request
+// arrived; a direct call without one takes its token now. After every await
+// below, a start that is no longer the latest returns without touching
+// `session` (and tears down its own session if it had already created one).
+async function beginSession(tabId, settings, isRecording, mode, frameId, token = startTokens.next()) {
   // Mint before replacing the old session so a new id never repeats the id
   // of the session it replaces.
   const sessionId = TTSPlayback.mintSessionId(Math.random, (id) => !!session && session.sessionId === id);
@@ -275,8 +326,13 @@ async function beginSession(tabId, settings, isRecording, mode, frameId) {
   // wikiroulette.co that embeds the actual article in a same/cross-
   // origin iframe and leaves only nav chrome in the main frame).
   const resolvedFrameId = frameId != null ? frameId : await pickBestFrame(tabId, mode);
+  if (!startTokens.isCurrent(token)) {
+    logSupersededStart('frame-probe', sessionId);
+    return;
+  }
 
   const s = newSession(tabId, resolvedFrameId, settings, isRecording, sessionId);
+  s.startToken = token;
   session = s;
   logEvent('session-start', {
     sessionId,
@@ -291,6 +347,7 @@ async function beginSession(tabId, settings, isRecording, mode, frameId) {
       target: { tabId, frameIds: [resolvedFrameId] },
       files: ['vendor/readability.js', 'sentenceSplitter.js', 'contentScript.js']
     });
+    if (abandonIfSuperseded(s, token, 'inject')) return;
 
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [resolvedFrameId] },
@@ -298,7 +355,7 @@ async function beginSession(tabId, settings, isRecording, mode, frameId) {
       args: [mode]
     });
 
-    if (!isActive(s)) return;
+    if (abandonIfSuperseded(s, token, 'prepare') || !isActive(s)) return;
 
     const sentences = (result && result.sentences) || [];
     if (sentences.length === 0) {
@@ -312,7 +369,7 @@ async function beginSession(tabId, settings, isRecording, mode, frameId) {
     logEvent('sentences', { sessionId, count: sentences.length });
 
     await setupOffscreenDocument();
-    if (!isActive(s)) return;
+    if (abandonIfSuperseded(s, token, 'offscreen') || !isActive(s)) return;
 
     ensureKeepAlive();
     await playFromIndex(s, 0);
@@ -324,6 +381,16 @@ async function beginSession(tabId, settings, isRecording, mode, frameId) {
       stopSession('error');
     }
   }
+}
+
+// A start that lost to a later one. Normally the later start's stopSession
+// already stopped `s`; if that later start never got that far, stop it here so
+// a superseded session is not left half-started.
+function abandonIfSuperseded(s, token, stage) {
+  if (startTokens.isCurrent(token)) return false;
+  logSupersededStart(stage, s.sessionId);
+  if (session === s && !s.stopped) stopSession('superseded');
+  return true;
 }
 
 /**
@@ -375,7 +442,40 @@ async function pickBestFrame(tabId, mode) {
   }
 }
 
+// A play that was abandoned because its session was replaced or stopped while
+// it waited on a fetch or the offscreen document. Nothing was sent to the
+// audio element; the log says why.
+function logSkippedPlay(s, index) {
+  logEvent('play-skipped', {
+    sessionId: s.sessionId,
+    index,
+    reason: session === s ? 'stopped' : 'replaced'
+  });
+}
+
+// A later start takes its token on arrival but only stops this session once it
+// reaches beginSession, so between those two moments this session must not
+// reach playChunk. beginSession checks the token after each of its own awaits;
+// playFromIndex re-checks it here for every sentence (not just the first)
+// after each await and before the playChunk broadcast. `stage` names the
+// check in the start-superseded log: `${first|next}-${advance|fetch|offscreen}`
+// (advance = the check on entry, before any await).
+// Returns true when `s` was superseded (and has been stopped). A session that
+// is already stopped (replaced by right-click Read Aloud, Stop then Play, an
+// error) was never a start that lost a race: return false without logging, and
+// the caller's isActive check skips the play and logs play-skipped instead.
+function supersededBeforePlay(s, index, step) {
+  if (s.startToken === null || s.stopped) return false;
+  return abandonIfSuperseded(s, s.startToken, `${index === 0 ? 'first' : 'next'}-${step}`);
+}
+
 async function playFromIndex(s, index) {
+  // Checked before the end-of-read branch too: a superseded session must not
+  // announce that it finished.
+  if (supersededBeforePlay(s, index, 'advance')) {
+    logSkippedPlay(s, index);
+    return;
+  }
   if (!isActive(s) || index >= s.sentences.length) {
     finishSession(s);
     return;
@@ -392,7 +492,10 @@ async function playFromIndex(s, index) {
       audioResult = await fetchChunkAudio(s, index);
     }
   } catch (error) {
-    if (!isActive(s)) return;
+    if (supersededBeforePlay(s, index, 'fetch') || !isActive(s)) {
+      logSkippedPlay(s, index);
+      return;
+    }
     console.error(`Error fetching chunk ${index}:`, error);
     logEvent('error', { sessionId: s.sessionId, index, error });
     broadcastError(error.message || 'Failed to reach the TTS server.');
@@ -400,14 +503,20 @@ async function playFromIndex(s, index) {
     return;
   }
 
-  if (!isActive(s)) return;
+  if (supersededBeforePlay(s, index, 'fetch') || !isActive(s)) {
+    logSkippedPlay(s, index);
+    return;
+  }
 
   // Re-verify (cheap no-op if it already exists) rather than trusting
   // the one-time setup at session start — guards against the offscreen
   // document having been silently torn down mid-session, which would
   // otherwise leave every future playChunk broadcast with no listener.
   await setupOffscreenDocument();
-  if (!isActive(s)) return;
+  if (supersededBeforePlay(s, index, 'offscreen') || !isActive(s)) {
+    logSkippedPlay(s, index);
+    return;
+  }
 
   s.currentIndex = index;
   if (s.isRecording) {
@@ -415,6 +524,9 @@ async function playFromIndex(s, index) {
   }
 
   const playNumber = s.playCounter.next(index);
+  s.currentPlayNumber = playNumber;
+  s.playEnded = false;
+  s.durationKnown = false;
   broadcast({
     type: 'playChunk',
     audioData: Array.from(new Uint8Array(audioResult.arrayBuffer)),
@@ -428,11 +540,13 @@ async function playFromIndex(s, index) {
   broadcast({
     type: 'sentenceProgress',
     index,
-    total: s.sentences.length
+    total: s.sentences.length,
+    sessionId: s.sessionId,
+    playNumber
   });
 
   notifyHighlight(s, index);
-  armChunkWatchdog(s, index);
+  armStallTimer(s, index, playNumber, undefined);
 
   // Start prefetching the next chunk while this one plays.
   const nextIndex = index + 1;
@@ -450,36 +564,88 @@ async function playFromIndex(s, index) {
 // ever fires afterward, and background.js has no signal that anything
 // went wrong — the session just sits there forever. Rather than leave
 // the whole read hung on one bad chunk, force-advance if a chunk we
-// believe is playing hasn't reported ended within a generous window.
-const CHUNK_WATCHDOG_MS = 20000;
+// believe is playing hasn't reported ended in time.
+//
+// "In time" depends on the sentence: until the offscreen document reports
+// the audio's duration the timeout is a fixed 60 s; once it has, the timeout
+// is duration + 5 s, so a long sentence (e.g. at 0.25x speed) is never cut
+// off. See TTSPlayback.stallTimeoutMs.
 
-function armChunkWatchdog(s, index) {
-  clearChunkWatchdog(s);
-  s.chunkWatchdogTimer = setTimeout(() => {
-    if (!isActive(s) || s.currentIndex !== index) return;
-    console.warn(`[TTS Reader] Chunk ${index} never reported ended after ${CHUNK_WATCHDOG_MS}ms; advancing anyway.`);
-    logEvent('watchdog', {
-      sessionId: s.sessionId,
-      index,
-      playNumber: s.playCounter.peek(index) - 1,
-      ms: CHUNK_WATCHDOG_MS
+function armStallTimer(s, index, playNumber, durationSec) {
+  clearStallTimer(s);
+  const timeoutMs = TTSPlayback.stallTimeoutMs({ durationSec, paused: Boolean(s.paused) });
+  if (timeoutMs === null) return; // paused: no deadline
+  s.stallTimer = setTimeout(() => {
+    s.stallTimer = null;
+    if (!isActive(s) || s.currentIndex !== index || s.currentPlayNumber !== playNumber) return;
+    // Counts as this play's end: a chunkEnded that turns up later is then a
+    // duplicate and is ignored, and a stall after a real end does nothing.
+    if (!s.endedLedger.accept(s.sessionId, index, playNumber).ok) return;
+    s.playEnded = true;
+    console.warn(`[TTS Reader] Chunk ${index} never reported ended after ${timeoutMs}ms; advancing anyway.`);
+    logEvent('stall', { sessionId: s.sessionId, index, playNumber, ms: timeoutMs });
+    playFromIndex(s, index + 1).catch((error) => {
+      console.error('Error advancing after a stall:', error);
+      if (!isActive(s)) return;
+      broadcastError(error.message);
+      stopSession('error');
     });
-    playFromIndex(s, index + 1);
-  }, CHUNK_WATCHDOG_MS);
+  }, timeoutMs);
 }
 
-function clearChunkWatchdog(s) {
-  if (s.chunkWatchdogTimer) {
-    clearTimeout(s.chunkWatchdogTimer);
-    s.chunkWatchdogTimer = null;
+function clearStallTimer(s) {
+  if (s.stallTimer) {
+    clearTimeout(s.stallTimer);
+    s.stallTimer = null;
   }
 }
 
-async function handleChunkEnded(endedIndex) {
+// The sentence playing right now, as the (session id, index, play number)
+// that messages about it must carry; null when nothing is playing.
+function liveTriple() {
   const s = session;
-  if (!s || s.stopped || endedIndex !== s.currentIndex) return;
-  clearChunkWatchdog(s);
-  await playFromIndex(s, endedIndex + 1);
+  if (!s || s.stopped || s.currentIndex < 0 || s.currentPlayNumber === null) return null;
+  return { sessionId: s.sessionId, index: s.currentIndex, playNumber: s.currentPlayNumber };
+}
+
+async function handleChunkEnded(message) {
+  const reason = TTSPlayback.staleReason(liveTriple(), message);
+  if (reason) {
+    logEvent('dropped-chunk-ended', { ...messageIds(message), reason });
+    return;
+  }
+  const s = session;
+  // Accepted once per triple, synchronously, so a second chunkEnded that
+  // arrives while playFromIndex is still awaiting the prefetch is a duplicate.
+  const verdict = s.endedLedger.accept(message.sessionId, message.index, message.playNumber);
+  if (!verdict.ok) {
+    logEvent('dropped-chunk-ended', { ...messageIds(message), reason: verdict.reason });
+    return;
+  }
+  s.playEnded = true;
+  clearStallTimer(s);
+  await playFromIndex(s, message.index + 1);
+}
+
+// The offscreen document reports the audio's duration once its metadata has
+// loaded. The first usable report for the current play replaces the 60 s
+// hang timeout with duration + 5 s. Anything else is ignored: a report for
+// another play, a duration of NaN, 0 or Infinity (which arrives as null),
+// a repeat, or one for a play that has already ended.
+function handleAudioDuration(message) {
+  const reason = TTSPlayback.staleReason(liveTriple(), message);
+  const s = session;
+  let ignore = reason;
+  if (!ignore && !TTSPlayback.isUsableDuration(message.duration)) ignore = 'bad-duration';
+  if (!ignore && s.durationKnown) ignore = 'duplicate';
+  if (!ignore && s.playEnded) ignore = 'ended';
+  if (ignore) {
+    logEvent('dropped-audio-duration', { ...messageIds(message), reason: ignore });
+    return;
+  }
+  s.durationKnown = true;
+  logEvent('audio-duration', { ...messageIds(message), ms: Math.round(message.duration * 1000) });
+  armStallTimer(s, message.index, message.playNumber, message.duration);
 }
 
 async function fetchChunkAudio(s, index, attempt = 1) {
@@ -594,7 +760,7 @@ function finishSession(s) {
   if (!isActive(s)) return;
   s.stopped = true;
   logEvent('session-end', { sessionId: s.sessionId, reason: 'finished' });
-  clearChunkWatchdog(s);
+  clearStallTimer(s);
   clearPageHighlight(s);
   finalizeRecording(s);
   clearKeepAliveIfIdle();
@@ -606,7 +772,7 @@ function stopSession(reason) {
   if (!s) return;
   if (!s.stopped) logEvent('session-end', { sessionId: s.sessionId, reason });
   s.stopped = true;
-  clearChunkWatchdog(s);
+  clearStallTimer(s);
   for (const controller of s.abortControllers.values()) {
     controller.abort();
   }
