@@ -219,6 +219,27 @@
       margin-top: 5px;
     }
 
+    .log-actions {
+      display: flex;
+      gap: 10px;
+    }
+
+    .log-btn {
+      flex: 1;
+      padding: 8px;
+      border: 1px solid #0f3460;
+      border-radius: 4px;
+      background-color: #0f3460;
+      color: #e6e6e6;
+      font: inherit;
+      cursor: pointer;
+      transition: background-color 0.3s ease;
+    }
+
+    .log-btn:hover {
+      background-color: #e94560;
+    }
+
     #status {
       margin-top: 15px;
       padding: 10px;
@@ -320,6 +341,15 @@
     <div class="setting-group">
       <label for="serverUrl">Server URL</label>
       <input type="text" id="serverUrl">
+    </div>
+
+    <div class="setting-group">
+      <label>Debug log</label>
+      <div class="log-actions">
+        <button type="button" class="log-btn" id="downloadLogBtn">Download log</button>
+        <button type="button" class="log-btn" id="clearLogBtn">Clear log</button>
+      </div>
+      <div class="helper-text">Always on. Kept on this Mac; holds ids, sizes and timings only, no page text or links.</div>
     </div>
   </div>
 

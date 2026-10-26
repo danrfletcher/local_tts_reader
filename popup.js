@@ -18,6 +18,47 @@ function updateStatus(message, isError = false) {
   setTimeout(() => status.className = '', 3000);
 }
 
+// --- Debug log ---------------------------------------------------------
+// The log belongs to background.js; the popup only asks for it (so this
+// works with the player idle and with no offscreen document running) and
+// saves it with a Blob + anchor, which needs no `downloads` permission.
+
+async function downloadDebugLog() {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'getDebugLog' });
+    if (!response || !response.success) {
+      throw new Error((response && response.error) || 'No response from the background.');
+    }
+    const blob = new Blob([JSON.stringify(response.log, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `tts-reader-log-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    updateStatus('Log downloaded', false);
+  } catch (error) {
+    console.error('Error downloading log:', error);
+    updateStatus(`Could not download log: ${error.message}`, true);
+  }
+}
+
+async function clearDebugLog() {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'clearDebugLog' });
+    if (!response || !response.success) {
+      throw new Error((response && response.error) || 'The log could not be cleared.');
+    }
+    updateStatus('Log cleared', false);
+  } catch (error) {
+    console.error('Error clearing log:', error);
+    updateStatus(`Could not clear log: ${error.message}`, true);
+  }
+}
+
 function updateControlButtons(state) {
   const playBtn = document.getElementById('playBtn');
   const pauseBtn = document.getElementById('pauseBtn');
@@ -157,6 +198,11 @@ function startSeekBarUpdates() {
 }
 
 document.addEventListener('DOMContentLoaded', async function() {
+  // Wired first, and independent of the player, so the log buttons work
+  // even if the audio player below fails to initialise.
+  document.getElementById('downloadLogBtn').addEventListener('click', downloadDebugLog);
+  document.getElementById('clearLogBtn').addEventListener('click', clearDebugLog);
+
   // Initialize audio player
   audioPlayer = new AudioPlayer();
   await audioPlayer.init();

@@ -1,10 +1,14 @@
 const audioElement = document.getElementById('audioElement');
 let currentChunkIndex = null;
+// Ids of the play attempt currently on the <audio> element, minted by
+// background.js and echoed back on audioReady / chunkEnded.
+let currentSessionId = null;
+let currentPlayNumber = null;
 let previousObjectUrl = null;
 
 // Play one prefetched sentence chunk. background.js is responsible for
 // ordering/prefetching; this just plays whatever it's told to, in order.
-function playChunk(audioDataArray, mimeType, index) {
+function playChunk(audioDataArray, mimeType, index, sessionId, playNumber) {
   try {
     const uint8Array = new Uint8Array(audioDataArray);
     const blob = new Blob([uint8Array], { type: mimeType });
@@ -15,6 +19,8 @@ function playChunk(audioDataArray, mimeType, index) {
     }
     previousObjectUrl = audioUrl;
     currentChunkIndex = index;
+    currentSessionId = sessionId ?? null;
+    currentPlayNumber = playNumber ?? null;
 
     audioElement.src = audioUrl;
     audioElement.play().catch((err) => {
@@ -22,7 +28,13 @@ function playChunk(audioDataArray, mimeType, index) {
       chrome.runtime.sendMessage({ type: 'streamError', error: err.message });
     });
 
-    chrome.runtime.sendMessage({ type: 'audioReady' });
+    chrome.runtime.sendMessage({
+      type: 'audioReady',
+      sessionId: currentSessionId,
+      index,
+      playNumber: currentPlayNumber,
+      audioElements: document.querySelectorAll('audio').length
+    });
   } catch (error) {
     console.error('Error processing audio chunk:', error);
     chrome.runtime.sendMessage({ type: 'streamError', error: error.message });
@@ -47,7 +59,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   switch (message.type) {
     case 'playChunk':
       if (message.audioData) {
-        playChunk(message.audioData, message.mimeType, message.index);
+        playChunk(message.audioData, message.mimeType, message.index, message.sessionId, message.playNumber);
       }
       break;
 
@@ -61,6 +73,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     case 'stop':
       currentChunkIndex = null;
+      currentSessionId = null;
+      currentPlayNumber = null;
       audioElement.pause();
       audioElement.currentTime = 0;
       audioElement.removeAttribute('src');
@@ -100,7 +114,12 @@ audioElement.onpause = () => {
 // over" — background.js decides whether there's a next chunk to play.
 audioElement.onended = () => {
   if (currentChunkIndex !== null) {
-    chrome.runtime.sendMessage({ type: 'chunkEnded', index: currentChunkIndex });
+    chrome.runtime.sendMessage({
+      type: 'chunkEnded',
+      index: currentChunkIndex,
+      sessionId: currentSessionId,
+      playNumber: currentPlayNumber
+    });
   }
 };
 

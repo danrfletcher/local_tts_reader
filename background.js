@@ -1,4 +1,4 @@
-importScripts('textProcessor.js');
+importScripts('textProcessor.js', 'lib/playback.js');
 
 let currentPlayerState = 'stopped';
 let creating = null; // A global promise to avoid concurrency issues
@@ -8,14 +8,45 @@ let creating = null; // A global promise to avoid concurrency issues
 // Only one session is active at a time.
 let session = null;
 
+// --- Always-on debug log -----------------------------------------------
+// Appended to only from this file; lives in chrome.storage.local under
+// 'ttsDebugLog'. Events are built from an allowlist (lib/playback.js), so
+// they hold ids, counts, sizes and hashes — never sentence text or URLs.
+// Logging must never change playback, so it never throws into the caller.
+const debugLog = TTSPlayback.createDebugLog({
+  storage: chrome.storage.local,
+  key: TTSPlayback.LOG_STORAGE_KEY,
+  onError: (error) => console.warn('[TTS Reader] Debug log write failed:', TTSPlayback.sanitizeError(error))
+});
+
+function logEvent(type, fields) {
+  try {
+    debugLog.append(TTSPlayback.buildEvent(type, fields));
+  } catch (error) {
+    console.warn('[TTS Reader] Could not log event:', TTSPlayback.sanitizeError(error));
+  }
+}
+
+// Ids from a message (offscreen echoes them back) are only logged if they
+// have the right shape; buildEvent drops anything else.
+function messageIds(message) {
+  return {
+    sessionId: message.sessionId,
+    index: message.index,
+    playNumber: message.playNumber
+  };
+}
+
 const FIRST_CHUNK_TIMEOUT_MS = 55000; // cold-start: backend may take ~30s to wake up
 const SUBSEQUENT_CHUNK_TIMEOUT_MS = 18000; // warm backend: ~1-2s typical
 const KEEPALIVE_ALARM_NAME = 'tts-reader-keepalive';
 const MIN_READABLE_FRAME_LENGTH = 200;
 const FRAME_PREFERENCE_MARGIN = 200;
 
-function newSession(tabId, frameId, settings, isRecording) {
+function newSession(tabId, frameId, settings, isRecording, sessionId) {
   return {
+    sessionId, // minted here; separate from the content script's numeric id
+    playCounter: TTSPlayback.createPlayCounter(),
     tabId,
     frameId,
     settings,
@@ -132,6 +163,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
 
     case 'audioReady':
+      logEvent('audio-ready', { ...messageIds(message), audioElements: message.audioElements });
       if (currentPlayerState === 'loading' || currentPlayerState === 'starting') {
         currentPlayerState = 'ready';
         broadcast({ type: 'playerStateUpdate', state: 'ready' });
@@ -139,6 +171,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
 
     case 'chunkEnded':
+      logEvent('chunk-ended', messageIds(message));
       handleChunkEnded(message.index).catch((error) => {
         console.error('Error handling chunk end:', error);
         broadcastError(error.message);
@@ -168,6 +201,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     case 'timeUpdate':
       broadcast(message);
       return true;
+
+    case 'getDebugLog':
+      buildDebugLogFile().then(
+        (log) => sendResponse({ success: true, log }),
+        (error) => sendResponse({ success: false, error: TTSPlayback.sanitizeError(error) })
+      );
+      return true;
+
+    case 'clearDebugLog':
+      debugLog.clear().then(
+        (ok) => sendResponse({ success: ok }),
+        (error) => sendResponse({ success: false, error: TTSPlayback.sanitizeError(error) })
+      );
+      return true;
   }
 });
 
@@ -178,6 +225,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 // logs it as an uncaught error against the extension.
 function broadcast(message) {
   chrome.runtime.sendMessage(message).catch(() => {});
+}
+
+// The popup's "Download log" asks the background (the only owner of the
+// log) rather than the offscreen document, which may not be running.
+async function buildDebugLogFile() {
+  const events = await debugLog.getAll();
+  return {
+    generatedAt: new Date().toISOString(),
+    extensionId: chrome.runtime.id,
+    version: chrome.runtime.getManifest().version,
+    eventCount: events.length,
+    sentences: TTSPlayback.summariseLog(events),
+    events
+  };
 }
 
 function handleControlAudio(action) {
@@ -193,6 +254,10 @@ function handleControlAudio(action) {
 // --- Session lifecycle ---------------------------------------------------
 
 async function beginSession(tabId, settings, isRecording, mode, frameId) {
+  // Mint before replacing the old session so a new id never repeats the id
+  // of the session it replaces.
+  const sessionId = TTSPlayback.mintSessionId(Math.random, (id) => !!session && session.sessionId === id);
+
   // Any previous session is replaced.
   stopSession('replaced');
 
@@ -211,8 +276,15 @@ async function beginSession(tabId, settings, isRecording, mode, frameId) {
   // origin iframe and leaves only nav chrome in the main frame).
   const resolvedFrameId = frameId != null ? frameId : await pickBestFrame(tabId, mode);
 
-  const s = newSession(tabId, resolvedFrameId, settings, isRecording);
+  const s = newSession(tabId, resolvedFrameId, settings, isRecording, sessionId);
   session = s;
+  logEvent('session-start', {
+    sessionId,
+    mode,
+    frameId: resolvedFrameId,
+    extensionId: chrome.runtime.id,
+    version: chrome.runtime.getManifest().version
+  });
 
   try {
     await chrome.scripting.executeScript({
@@ -237,6 +309,7 @@ async function beginSession(tabId, settings, isRecording, mode, frameId) {
 
     s.sentences = sentences;
     s.contentSessionId = result.sessionId;
+    logEvent('sentences', { sessionId, count: sentences.length });
 
     await setupOffscreenDocument();
     if (!isActive(s)) return;
@@ -245,6 +318,7 @@ async function beginSession(tabId, settings, isRecording, mode, frameId) {
     await playFromIndex(s, 0);
   } catch (error) {
     console.error('Error beginning session:', error);
+    logEvent('error', { sessionId, error });
     if (isActive(s)) {
       broadcastError(error.message);
       stopSession('error');
@@ -320,6 +394,7 @@ async function playFromIndex(s, index) {
   } catch (error) {
     if (!isActive(s)) return;
     console.error(`Error fetching chunk ${index}:`, error);
+    logEvent('error', { sessionId: s.sessionId, index, error });
     broadcastError(error.message || 'Failed to reach the TTS server.');
     stopSession('error');
     return;
@@ -339,12 +414,16 @@ async function playFromIndex(s, index) {
     s.recordedChunks.push(audioResult);
   }
 
+  const playNumber = s.playCounter.next(index);
   broadcast({
     type: 'playChunk',
     audioData: Array.from(new Uint8Array(audioResult.arrayBuffer)),
     mimeType: audioResult.mimeType,
-    index
+    index,
+    sessionId: s.sessionId,
+    playNumber
   });
+  logEvent('play', { sessionId: s.sessionId, index, playNumber });
 
   broadcast({
     type: 'sentenceProgress',
@@ -379,6 +458,12 @@ function armChunkWatchdog(s, index) {
   s.chunkWatchdogTimer = setTimeout(() => {
     if (!isActive(s) || s.currentIndex !== index) return;
     console.warn(`[TTS Reader] Chunk ${index} never reported ended after ${CHUNK_WATCHDOG_MS}ms; advancing anyway.`);
+    logEvent('watchdog', {
+      sessionId: s.sessionId,
+      index,
+      playNumber: s.playCounter.peek(index) - 1,
+      ms: CHUNK_WATCHDOG_MS
+    });
     playFromIndex(s, index + 1);
   }, CHUNK_WATCHDOG_MS);
 }
@@ -403,6 +488,20 @@ async function fetchChunkAudio(s, index, attempt = 1) {
   const controller = new AbortController();
   s.abortControllers.set(index, controller);
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = Date.now();
+  // Every HTTP attempt is one 'fetch' event, so a timeout retry shows as two.
+  let attemptLogged = false;
+  const logFetch = (fields) => {
+    attemptLogged = true;
+    logEvent('fetch', {
+      sessionId: s.sessionId,
+      index,
+      playNumber: s.playCounter.peek(index),
+      attempt,
+      ms: Date.now() - startedAt,
+      ...fields
+    });
+  };
 
   try {
     const response = await fetch(s.settings.serverUrl, {
@@ -421,15 +520,28 @@ async function fetchChunkAudio(s, index, attempt = 1) {
     });
 
     if (!response.ok) {
+      logFetch({ outcome: 'http-error', status: response.status });
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 
     const audioBlob = await response.blob();
     const mimeType = audioBlob.type || 'audio/mpeg';
     const arrayBuffer = await audioBlob.arrayBuffer();
+    let hash;
+    try {
+      hash = await TTSPlayback.sha256Prefix(arrayBuffer);
+    } catch (hashError) {
+      console.warn('[TTS Reader] Could not hash audio:', TTSPlayback.sanitizeError(hashError));
+    }
+    logFetch({ outcome: 'ok', bytes: arrayBuffer.byteLength, hash });
     return { arrayBuffer, mimeType };
   } catch (error) {
     const wasAborted = error.name === 'AbortError';
+    if (!attemptLogged) {
+      logFetch(wasAborted
+        ? { outcome: isActive(s) ? 'timeout' : 'aborted' }
+        : { outcome: 'error', error });
+    }
     if (wasAborted && attempt < 2 && isActive(s)) {
       // One retry on timeout before surfacing an error.
       return fetchChunkAudio(s, index, attempt + 1);
@@ -481,6 +593,7 @@ function clearPageHighlight(s) {
 function finishSession(s) {
   if (!isActive(s)) return;
   s.stopped = true;
+  logEvent('session-end', { sessionId: s.sessionId, reason: 'finished' });
   clearChunkWatchdog(s);
   clearPageHighlight(s);
   finalizeRecording(s);
@@ -488,9 +601,10 @@ function finishSession(s) {
   setPlayerState('stopped');
 }
 
-function stopSession(_reason) {
+function stopSession(reason) {
   const s = session;
   if (!s) return;
+  if (!s.stopped) logEvent('session-end', { sessionId: s.sessionId, reason });
   s.stopped = true;
   clearChunkWatchdog(s);
   for (const controller of s.abortControllers.values()) {
