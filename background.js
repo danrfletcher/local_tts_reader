@@ -48,6 +48,128 @@ const SUBSEQUENT_CHUNK_TIMEOUT_MS = 18000; // warm backend: ~1-2s typical
 const KEEPALIVE_ALARM_NAME = 'tts-reader-keepalive';
 const MIN_READABLE_FRAME_LENGTH = 200;
 const FRAME_PREFERENCE_MARGIN = 200;
+const DEFAULT_SERVER_URL = 'http://localhost:8000/v1/audio/speech';
+
+// --- Session state kept across service-worker restarts -------------------
+// Chrome stops the worker when it is idle and may restart it while a session
+// is paused. The session's sentences and position are written to
+// chrome.storage.session (browser memory only, cleared when the browser
+// closes) on start, every play, Pause and Play; a restarted worker rebuilds a
+// paused session from it (hydrateSession). Writes never throw into playback.
+// The stored record holds the sentences (needed to carry on reading) but no
+// page URL and no TTS server URL: see TTSPlayback.buildStoredSession.
+const sessionStore = TTSPlayback.createSessionStore({
+  storage: chrome.storage.session,
+  onError: (error) => console.warn('[TTS Reader] Session state write failed:', TTSPlayback.sanitizeError(error))
+});
+
+function persistSession(s) {
+  if (!s || s.stopped || session !== s || s.sentences.length === 0) return;
+  try {
+    sessionStore.save(TTSPlayback.buildStoredSession(s), s.sentences);
+  } catch (error) {
+    console.warn('[TTS Reader] Could not store session state:', TTSPlayback.sanitizeError(error));
+  }
+}
+
+function forgetStoredSession() {
+  try {
+    sessionStore.clear();
+  } catch (error) {
+    console.warn('[TTS Reader] Could not clear session state:', TTSPlayback.sanitizeError(error));
+  }
+}
+
+// Every handler waits for this before it looks at `session`, so the first
+// message a restarted worker handles sees the rebuilt session instead of
+// answering "stopped". It never rejects.
+let hydrated = false;
+let hydration = null;
+
+function ensureHydrated() {
+  if (!hydration) {
+    hydration = hydrateSession()
+      .catch((error) => console.warn('[TTS Reader] Could not rebuild the session:', TTSPlayback.sanitizeError(error)))
+      .then(() => { hydrated = true; });
+  }
+  return hydration;
+}
+
+function discardStoredSession(reason) {
+  logEvent('session-discarded', { reason });
+  forgetStoredSession();
+}
+
+/**
+ * Rebuild the paused session a previous worker stored, if there is one and it
+ * is still usable: the stored shape is complete, the tab still exists and the
+ * settings can be read. Anything else is discarded (and cleared from storage),
+ * so Play starts a new session as usual. Resolves to the rebuilt session or
+ * null; never throws.
+ */
+async function hydrateSession() {
+  let loaded;
+  try {
+    loaded = await sessionStore.load();
+  } catch (error) {
+    console.warn('[TTS Reader] Could not read stored session state:', TTSPlayback.sanitizeError(error));
+    discardStoredSession('read-failed');
+    return null;
+  }
+  if (loaded.meta === undefined && loaded.sentences === undefined) return null; // nothing stored
+
+  const parsed = TTSPlayback.parseStoredSession(loaded.meta, loaded.sentences);
+  if (!parsed.ok) {
+    discardStoredSession(parsed.reason);
+    return null;
+  }
+  const stored = parsed.value;
+
+  try {
+    await chrome.tabs.get(stored.tabId);
+  } catch (_error) {
+    discardStoredSession('tab-gone'); // stale: the tab it was reading no longer exists
+    return null;
+  }
+
+  let serverUrl;
+  try {
+    ({ serverUrl } = await chrome.storage.local.get({ serverUrl: DEFAULT_SERVER_URL }));
+  } catch (_error) {
+    discardStoredSession('settings-failed');
+    return null;
+  }
+  if (typeof serverUrl !== 'string' || serverUrl === '') serverUrl = DEFAULT_SERVER_URL;
+
+  if (session) return null; // a session exists already; never replace it with an old one
+
+  const s = newSession(stored.tabId, stored.frameId, { ...stored.settings, serverUrl }, stored.isRecording, stored.sessionId);
+  s.sentences = stored.sentences;
+  s.contentSessionId = stored.contentSessionId;
+  s.currentIndex = stored.currentIndex;
+  s.currentPlayNumber = stored.playNumber > 0 ? stored.playNumber : null;
+  s.playCounter.seed(stored.currentIndex, stored.playNumber);
+  s.paused = true;
+  if (stored.advance) {
+    // The sentence at currentIndex had already ended (or the next one was
+    // loading) when the Pause happened: Play moves on to the next sentence,
+    // as in the worker that stored this. Nothing about the old audio
+    // document matters for that, so this is an ordinary paused session
+    // waiting to advance, and playing the next sentence is not a replay.
+    s.advanceOnResume = true;
+  } else {
+    s.hydrated = true;
+  }
+  session = s;
+  currentPlayerState = 'paused';
+  ensureKeepAlive(); // the alarm keeps running while paused
+  logEvent('session-hydrated', {
+    sessionId: s.sessionId,
+    count: s.sentences.length,
+    ...(s.currentIndex >= 0 ? { index: s.currentIndex } : {})
+  });
+  return s;
+}
 
 function newSession(tabId, frameId, settings, isRecording, sessionId) {
   const s = {
@@ -77,6 +199,20 @@ function newSession(tabId, frameId, settings, isRecording, sessionId) {
     // The sentence whose bytes were loaded while paused, kept until Play:
     // { index, audioResult }.
     heldChunk: null,
+    // The audio of the sentence handed to the audio element, { index,
+    // audioResult }, kept until that sentence ends (or Stop / replacement) so
+    // Play can replay it after Chrome closed the audio document, without
+    // fetching it again.
+    currentAudio: null,
+    // audioDocumentGeneration when this session's current sentence was sent
+    // to the audio document; null until the first playChunk.
+    audioGeneration: null,
+    // Rebuilt from chrome.storage.session after a worker restart and not played
+    // since: the bytes are gone and the audio document's state is unknown.
+    hydrated: false,
+    // A Play is deciding how to resume (it awaits getContexts / the document
+    // being recreated); a second Play meanwhile does nothing.
+    resuming: false,
     // A sentence ended while paused; Play plays the one after it.
     advanceOnResume: false,
     // Index of the sentence playFromIndex is fetching or about to hand to the
@@ -97,29 +233,58 @@ function isActive(s) {
   return session === s && !s.stopped;
 }
 
+// Is the audio document there right now? getContexts rejecting counts as
+// absent: the caller then tries to create it, and createDocument says if it
+// was there after all.
+async function offscreenDocumentPresent() {
+  try {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+      documentUrls: [chrome.runtime.getURL('./offscreen.html')]
+    });
+    return contexts.length > 0;
+  } catch (_error) {
+    return false;
+  }
+}
+
+// Chrome allows one offscreen document, and a second createDocument rejects
+// with this message: the document is there, which is all we wanted.
+function isSingleDocumentError(error) {
+  return /Only a single offscreen document/i.test(String(error && error.message));
+}
+
+// Which audio document is up. Every time createDocument really creates one
+// (not when it says one exists already) this goes up by one; each playChunk
+// records the value it was sent under (s.audioGeneration). Chrome closes the
+// document after 30 s without audio and the popup's setupOffscreen message
+// then makes a fresh, empty one, so "a document exists" does not mean "the
+// document that holds this session's sentence": only the same generation does.
+let audioDocumentGeneration = 0;
+
 async function setupOffscreenDocument() {
   const path = './offscreen.html';
-  const offscreenUrl = chrome.runtime.getURL(path);
-  const existingContexts = await chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT'],
-    documentUrls: [offscreenUrl],
-  });
+  if (await offscreenDocumentPresent()) return;
 
-  if (existingContexts.length > 0) {
-    return;
-  }
-
-  if (creating) {
-    await creating;
-  } else {
-    creating = chrome.offscreen.createDocument({
+  // One creation at a time: callers that arrive while it is in flight wait
+  // for it instead of starting another.
+  if (!creating) {
+    const attempt = chrome.offscreen.createDocument({
       url: path,
       reasons: ['AUDIO_PLAYBACK'],
       justification: 'Playing TTS audio in the background'
+    }).then(() => {
+      audioDocumentGeneration += 1; // a new, empty document
+    }, (error) => {
+      if (!isSingleDocumentError(error)) throw error;
     });
-    await creating;
-    creating = null;
+    creating = attempt;
+    // Reset on success and on failure, so one failed attempt cannot make
+    // every later call await the same rejected promise.
+    const reset = () => { if (creating === attempt) creating = null; };
+    attempt.then(reset, reset);
   }
+  await creating;
 }
 
 // Set up context menu items
@@ -149,8 +314,9 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 async function startReadingFromTab(tabId, frameId) {
   const token = startTokens.next();
   try {
+    await ensureHydrated(); // a restarted worker's paused session is replaced like any other
     const settings = await chrome.storage.local.get({
-      serverUrl: 'http://localhost:8000/v1/audio/speech',
+      serverUrl: DEFAULT_SERVER_URL,
       voice: 'af_bella',
       speed: 1.0,
       recordAudio: false,
@@ -167,15 +333,34 @@ async function startReadingFromTab(tabId, frameId) {
   }
 }
 
-// Handle messages from popup or offscreen document
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+// Handle messages from popup or offscreen document. A restarted worker has no
+// `session` until it has rebuilt the stored one, so until then a message waits
+// (the channel stays open) and is handled once hydration is done: the first
+// message after a restart sees the paused session, never "stopped".
+const HANDLED_MESSAGE_TYPES = new Set([
+  'setupOffscreen', 'startStreaming', 'controlAudio', 'stopSession', 'stateUpdate',
+  'getSessionState', 'audioReady', 'chunkEnded', 'audioDuration', 'playDropped',
+  'getPlayerState', 'seek', 'getTimeInfo', 'timeUpdate', 'getDebugLog', 'clearDebugLog'
+]);
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || !HANDLED_MESSAGE_TYPES.has(message.type)) return false;
+  if (hydrated) return handleMessage(message, sender, sendResponse);
+  // A start takes its token on arrival, not once hydration is done, so the
+  // order of overlapping starts is the order they were pressed in.
+  const arrivalToken = message.type === 'startStreaming' ? startTokens.next() : undefined;
+  ensureHydrated().then(() => handleMessage(message, sender, sendResponse, arrivalToken));
+  return true;
+});
+
+function handleMessage(message, _sender, sendResponse, arrivalToken) {
   switch (message.type) {
     case 'setupOffscreen':
       setupOffscreenDocument().then(() => sendResponse({ success: true }));
       return true;
 
     case 'startStreaming': {
-      const token = startTokens.next();
+      const token = arrivalToken !== undefined ? arrivalToken : startTokens.next();
       (async () => {
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
         const tabId = tabs[0]?.id ?? null;
@@ -279,7 +464,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       );
       return true;
   }
-});
+  return false;
+}
 
 // Fire-and-forget broadcast to other extension contexts (popup,
 // offscreen document). If nothing is listening right now (e.g. the
@@ -376,6 +562,24 @@ function handleControlAudio(message) {
   }
 
   const transition = TTSPlayback.playbackTransition(phaseOf(s), action, flagsOf(s));
+  // A rebuilt session has no audio element of its own to resume (its flags
+  // cannot say what the audio document holds), so every Play decides afresh.
+  const resumeAudio = action === 'play' && s.paused && (s.hydrated || transition.action === 'resume-audio');
+  if (resumeAudio) {
+    if (s.resuming) {
+      // Play pressed again while the first is recreating the document.
+      logControlDropped(message, 'resume-pending');
+      return;
+    }
+    s.resuming = true; // synchronously, before the first await
+    resumePausedAudio(s).catch((error) => {
+      console.error('Error resuming after Play:', error);
+      if (!isActive(s)) return;
+      logEvent('error', { sessionId: s.sessionId, error });
+      broadcastError(TTSPlayback.sanitizeError(error)); // the session stays paused
+    });
+    return;
+  }
   switch (transition.action) {
     case 'pause':
       s.paused = true;
@@ -385,16 +589,7 @@ function handleControlAudio(message) {
       broadcast({ type: 'pause', sessionId: s.sessionId });
       setPlayerState('paused');
       logEvent('pause', { sessionId: s.sessionId, ...(s.currentIndex >= 0 ? { index: s.currentIndex } : {}) });
-      break;
-
-    case 'resume-audio':
-      // Same session, same sentence, nothing to fetch: the audio element
-      // carries on, and the stall timer is re-armed for that sentence.
-      s.paused = false;
-      broadcast({ type: 'play', sessionId: s.sessionId });
-      armStallTimer(s, s.currentIndex, s.currentPlayNumber, s.durationSec);
-      setPlayerState('playing');
-      logEvent('resume', { sessionId: s.sessionId, index: s.currentIndex, reason: 'resume-audio' });
+      persistSession(s);
       break;
 
     case 'resume-held': {
@@ -422,6 +617,7 @@ function handleControlAudio(message) {
       s.paused = false;
       setPlayerState(s.loadingIndex === null || s.loadingIndex === 0 ? 'starting' : 'loading');
       logEvent('resume', { sessionId: s.sessionId, reason: 'resume-wait' });
+      persistSession(s);
       break;
 
     default:
@@ -431,9 +627,70 @@ function handleControlAudio(message) {
   }
 }
 
+// Play on a paused session whose current sentence is already loaded in the
+// audio element (the transition's 'resume-audio'), or on a rebuilt one. Which
+// of the three resumes it gets depends on whether Chrome has closed the audio
+// document since the Pause (TTSPlayback.decideResume); see the notes there.
+// `s.resuming` is already set by the caller and is cleared here.
+async function resumePausedAudio(s) {
+  try {
+    const offscreenPresent = await offscreenDocumentPresent();
+    if (!isActive(s) || !s.paused) return; // Stopped or replaced meanwhile
+
+    const kept = s.currentAudio && s.currentAudio.index === s.currentIndex ? s.currentAudio : null;
+    // "Present" means the document that was sent this session's current
+    // sentence. A document the popup (or anything else) created after Chrome
+    // closed that one is present but empty, and a bare `play` would reach
+    // nobody who can use it.
+    const sameDocument = offscreenPresent && s.audioGeneration === audioDocumentGeneration;
+    const decision = TTSPlayback.decideResume({
+      paused: s.paused,
+      offscreenPresent: sameDocument,
+      haveBytes: kept !== null,
+      hydrated: s.hydrated
+    });
+
+    if (decision === 'continue') {
+      // Same session, same sentence, nothing to fetch: the audio element
+      // carries on, and the stall timer is re-armed for that sentence.
+      s.paused = false;
+      broadcast({ type: 'play', sessionId: s.sessionId });
+      armStallTimer(s, s.currentIndex, s.currentPlayNumber, s.durationSec);
+      setPlayerState('playing');
+      logEvent('resume', { sessionId: s.sessionId, index: s.currentIndex, reason: 'resume-audio' });
+      persistSession(s);
+      return;
+    }
+    if (decision === 'none') return;
+
+    // The audio is gone. Bring the document back before leaving the paused
+    // state: if that fails the session stays paused and says so.
+    try {
+      await setupOffscreenDocument();
+    } catch (error) {
+      console.error('Error recreating the offscreen document:', error);
+      logEvent('error', { sessionId: s.sessionId, error });
+      if (isActive(s)) broadcastError(TTSPlayback.sanitizeError(error) || 'Could not restart the audio player.');
+      return;
+    }
+    if (!isActive(s) || !s.paused) return;
+
+    // A session paused before its first sentence played starts at the first.
+    const index = Math.max(0, s.currentIndex);
+    s.paused = false;
+    s.hydrated = false;
+    if (decision === 'replay-from-bytes') s.heldChunk = { index, audioResult: kept.audioResult };
+    setPlayerState(index === 0 ? 'starting' : 'loading');
+    logEvent('resume', { sessionId: s.sessionId, index, reason: decision });
+    runPlay(s, index, decision);
+  } finally {
+    s.resuming = false;
+  }
+}
+
 /** playFromIndex from a control path, with the same failure handling as a stall advance. */
-function runPlay(s, index) {
-  playFromIndex(s, index).catch((error) => {
+function runPlay(s, index, replayKind) {
+  playFromIndex(s, index, { replayKind }).catch((error) => {
     console.error('Error playing after Play:', error);
     if (!isActive(s)) return;
     broadcastError(error.message);
@@ -532,6 +789,7 @@ async function beginSession(tabId, settings, isRecording, mode, frameId, token =
     s.sentences = sentences;
     s.contentSessionId = result.sessionId;
     logEvent('sentences', { sessionId, count: sentences.length });
+    persistSession(s); // from here a restarted worker can rebuild this session
 
     await setupOffscreenDocument();
     if (abandonIfSuperseded(s, token, 'offscreen') || !isActive(s)) return;
@@ -634,7 +892,7 @@ function supersededBeforePlay(s, index, step) {
   return abandonIfSuperseded(s, s.startToken, `${index === 0 ? 'first' : 'next'}-${step}`);
 }
 
-async function playFromIndex(s, index) {
+async function playFromIndex(s, index, { replayKind } = {}) {
   // Checked before the end-of-read branch too: a superseded session must not
   // announce that it finished.
   if (supersededBeforePlay(s, index, 'advance')) {
@@ -700,7 +958,9 @@ async function playFromIndex(s, index) {
   }
 
   s.currentIndex = index;
-  if (s.isRecording) {
+  // Not a new sentence when a resume plays the current one again: it was
+  // recorded the first time.
+  if (s.isRecording && !replayKind) {
     s.recordedChunks.push(audioResult);
   }
 
@@ -709,6 +969,9 @@ async function playFromIndex(s, index) {
   s.playEnded = false;
   s.durationKnown = false;
   s.durationSec = null;
+  // Kept until this sentence ends, for a replay after Chrome closes the audio.
+  s.currentAudio = { index, audioResult };
+  s.audioGeneration = audioDocumentGeneration; // the document this goes to (setupOffscreenDocument ran just above)
   broadcast({
     type: 'playChunk',
     audioData: Array.from(new Uint8Array(audioResult.arrayBuffer)),
@@ -718,6 +981,11 @@ async function playFromIndex(s, index) {
     playNumber
   });
   logEvent('play', { sessionId: s.sessionId, index, playNumber });
+  // A play number above 1 is this sentence handed over again: no text, no URL.
+  if (replayKind && playNumber > 1) {
+    logEvent('replay', { sessionId: s.sessionId, index, playNumber, kind: replayKind });
+  }
+  persistSession(s);
 
   broadcast({
     type: 'sentenceProgress',
@@ -728,11 +996,14 @@ async function playFromIndex(s, index) {
   });
 
   notifyHighlight(s, index);
+  // Always the fixed hang timeout here: the duration is only known once the
+  // audio document reports loadedmetadata for this play.
   armStallTimer(s, index, playNumber, undefined);
 
-  // Start prefetching the next chunk while this one plays.
+  // Start prefetching the next chunk while this one plays (a replay already
+  // has it, or its fetch, from the first play).
   const nextIndex = index + 1;
-  if (nextIndex < s.sentences.length) {
+  if (nextIndex < s.sentences.length && !(s.prefetch && s.prefetch.index === nextIndex)) {
     const promise = fetchChunkAudio(s, nextIndex);
     s.prefetch = { index: nextIndex, promise };
     promise.catch(() => {}); // handled when it's actually consumed
@@ -764,6 +1035,7 @@ function armStallTimer(s, index, playNumber, durationSec) {
     // duplicate and is ignored, and a stall after a real end does nothing.
     if (!s.endedLedger.accept(s.sessionId, index, playNumber).ok) return;
     s.playEnded = true;
+    s.currentAudio = null; // this sentence is over; its bytes are not needed again
     console.warn(`[TTS Reader] Chunk ${index} never reported ended after ${timeoutMs}ms; advancing anyway.`);
     logEvent('stall', { sessionId: s.sessionId, index, playNumber, ms: timeoutMs });
     playFromIndex(s, index + 1).catch((error) => {
@@ -805,6 +1077,7 @@ async function handleChunkEnded(message) {
     return;
   }
   s.playEnded = true;
+  s.currentAudio = null; // this sentence is over; its bytes are not needed again
   clearStallTimer(s);
   const transition = TTSPlayback.playbackTransition(phaseOf(s), 'chunkEnded', flagsOf(s));
   if (transition.action === 'defer-advance') {
@@ -812,6 +1085,7 @@ async function handleChunkEnded(message) {
     // plays the next one, once.
     s.advanceOnResume = true;
     logEvent('advance-deferred', { sessionId: s.sessionId, index: message.index });
+    persistSession(s); // a restarted worker must also move on, not replay the sentence that ended
     return;
   }
   if (transition.action !== 'advance') return;
@@ -951,6 +1225,7 @@ function clearPageHighlight(s) {
 function clearPauseState(s) {
   s.paused = false;
   s.heldChunk = null;
+  s.currentAudio = null;
   s.advanceOnResume = false;
   s.loadingIndex = null;
 }
@@ -959,6 +1234,7 @@ function finishSession(s) {
   if (!isActive(s)) return;
   s.stopped = true;
   clearPauseState(s);
+  forgetStoredSession();
   logEvent('session-end', { sessionId: s.sessionId, reason: 'finished' });
   clearStallTimer(s);
   clearPageHighlight(s);
@@ -973,6 +1249,7 @@ function stopSession(reason) {
   if (!s.stopped) logEvent('session-end', { sessionId: s.sessionId, reason });
   s.stopped = true;
   clearPauseState(s); // a Stop (or replacement) ends a pause and drops any held chunk
+  forgetStoredSession();
   clearStallTimer(s);
   for (const controller of s.abortControllers.values()) {
     controller.abort();
@@ -1038,6 +1315,14 @@ function clearKeepAliveIfIdle() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== KEEPALIVE_ALARM_NAME) return;
+  // A worker the alarm just woke has no `session` until it has rebuilt the
+  // stored paused one; deciding before that would clear the alarm that is
+  // keeping the paused session alive.
+  if (hydrated) onKeepAlive();
+  else ensureHydrated().then(onKeepAlive);
+});
+
+function onKeepAlive() {
   if (!session || session.stopped) {
     chrome.alarms.clear(KEEPALIVE_ALARM_NAME);
     return;
@@ -1045,9 +1330,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   // Any extension-API call is enough to register activity and keep the
   // worker warm through a long in-flight fetch.
   chrome.storage.local.get('__ttsKeepAlivePing', () => {});
-});
+}
 
 // Initialize context menu when extension is installed or updated
 chrome.runtime.onInstalled.addListener(() => {
   setupContextMenu();
 });
+
+// A worker that just started looks for a paused session its predecessor stored.
+// Every handler above waits for this (ensureHydrated / `hydrated`).
+ensureHydrated();

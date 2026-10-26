@@ -438,7 +438,7 @@ test('Added: the offscreen "playing" report of an unpaused session still sets pl
   assert.equal(await playerState(bg), 'playing');
 });
 
-test('Added: the offscreen document is unreachable at Pause: paused is still recorded, the failure is swallowed, and Play starts nothing on its own', async () => {
+test('Added: the offscreen document is unreachable at Pause: paused is still recorded, the failure is swallowed, and Play replays the sentence once it has recreated the document', async () => {
   const { bg, fetch } = setup();
   const chunk = await readUpTo(bg, 1);
   bg.closeOffscreen();
@@ -458,10 +458,14 @@ test('Added: the offscreen document is unreachable at Pause: paused is still rec
     const fetchesBefore = fetch.calls.length;
     await control(bg, 'play', chunk.sessionId);
     await settle();
-    assert.equal(count(bg, 'play'), 1);
-    assert.equal(playChunks(bg).length, 2, 'Play did not start a sentence');
-    assert.equal(bg.createdOffscreen.length, createdBefore, 'Play did not recreate the offscreen document (that is PR-4)');
-    assert.equal(fetch.calls.length, fetchesBefore);
+    // PR-4: with the document gone Play recreates it and plays the kept sentence
+    // again, as play number 2, rather than sending `play` to nobody.
+    assert.equal(count(bg, 'play'), 0, 'no play message went to the missing document');
+    assert.equal(bg.createdOffscreen.length, createdBefore + 1);
+    assert.equal(playChunks(bg).length, 3);
+    assert.equal(playChunks(bg)[2].index, chunk.index);
+    assert.equal(playChunks(bg)[2].playNumber, 2);
+    assert.equal(fetch.calls.length, fetchesBefore, 'the kept bytes were replayed, nothing was fetched');
     await settle();
   } finally {
     process.off('unhandledRejection', onUnhandled);

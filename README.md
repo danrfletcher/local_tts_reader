@@ -120,6 +120,14 @@ A background `chrome.alarms` heartbeat runs while a session is active,
 to reduce the chance Chrome terminates the extension's MV3 service
 worker while waiting on a slow (cold-start) response.
 
+While a session is active its sentences and position are also kept in
+`chrome.storage.session` (browser memory only; cleared when the browser
+closes, on Stop and when the read finishes). If Chrome restarts the
+service worker during a long Pause, the new worker rebuilds the paused
+session from that, and Play fetches the current sentence again and reads
+it from its start. If only the audio document was closed, Play replays the
+kept audio of the current sentence. No page URL or TTS server URL is stored.
+
 ## Development
 
 The extension's main files:

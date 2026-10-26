@@ -148,6 +148,10 @@ function createFakeChrome(options = {}) {
   const createdOffscreen = [];
   const contextMenusCreated = [];
   let rejectMessage = null; // (message) => boolean: nobody is listening for it
+  const openTabs = new Set([tabId, ...(options.openTabs || [])]);
+  let getContextsFailure = null; // an Error getContexts rejects with, or null
+  let createDocumentFailure = null; // an Error createDocument rejects with, or null
+  let createDocumentGate = null; // a promise createDocument waits on, or null
 
   const chrome = {
     storage: { local: createStorageArea(localStorage), session: createStorageArea(sessionStorage) },
@@ -167,18 +171,30 @@ function createFakeChrome(options = {}) {
         }
         return Promise.resolve(undefined);
       },
-      getContexts: async () => offscreenContexts.slice(),
+      getContexts: async () => {
+        if (getContextsFailure) throw getContextsFailure;
+        return offscreenContexts.slice();
+      },
       onMessage: { addListener: (fn) => listeners.message.push(fn) },
       onInstalled: { addListener: (fn) => listeners.installed.push(fn) }
     },
     offscreen: {
       async createDocument(opts) {
         createdOffscreen.push(opts);
+        if (createDocumentGate) await createDocumentGate;
+        if (createDocumentFailure) throw createDocumentFailure;
+        // As Chrome: an extension may have only one offscreen document.
+        if (offscreenContexts.length > 0) throw new Error('Only a single offscreen document may be created.');
         offscreenContexts = [{ contextType: 'OFFSCREEN_DOCUMENT', documentUrl: chrome.runtime.getURL(opts.url) }];
       }
     },
     tabs: {
       query: async () => [{ id: tabId, url: tabUrl }],
+      // Rejects for a tab that no longer exists, as Chrome does.
+      get: async (id) => {
+        if (!openTabs.has(id)) throw new Error(`No tab with id: ${id}.`);
+        return { id, url: tabUrl };
+      },
       sendMessage(id, message, opts) {
         tabMessages.push({ tabId: id, message: clone(message), options: opts });
         return Promise.resolve();
@@ -225,6 +241,24 @@ function createFakeChrome(options = {}) {
     listeners,
     closeOffscreen() {
       offscreenContexts = [];
+    },
+    /** Make getContexts reject with `error` (null to stop). */
+    failGetContexts(error) {
+      getContextsFailure = error;
+    },
+    /** Make createDocument reject with `error` (null to stop). */
+    failCreateDocument(error) {
+      createDocumentFailure = error;
+    },
+    /** Hold createDocument until the returned release() is called. */
+    holdCreateDocument() {
+      let release;
+      createDocumentGate = new Promise((resolve) => { release = () => { createDocumentGate = null; resolve(); }; });
+      return release;
+    },
+    /** The tab goes away: chrome.tabs.get rejects for it from now on. */
+    closeTab(id = tabId) {
+      openTabs.delete(id);
     },
     /** Make runtime.sendMessage reject for messages matching `predicate` (null to stop). */
     rejectMessages(predicate) {
