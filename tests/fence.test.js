@@ -11,15 +11,23 @@ const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8');
 
 // --- F1: server URL, model, voice and speed settings --------------------------------
 
-test('F1: DEFAULT_SETTINGS keys and values are unchanged', () => {
+test('G10: DEFAULT_SETTINGS has the 8090 Server URL and an empty voice (meaning the first voice); the other keys are unchanged', () => {
   const { DEFAULT_SETTINGS } = require('../constants.js');
   assert.deepEqual(DEFAULT_SETTINGS, {
-    serverUrl: 'http://localhost:8000/v1/audio/speech',
-    voice: 'af_bella',
+    serverUrl: 'http://localhost:8090/v1/audio/speech',
+    voice: '',
     speed: 1.0,
     recordAudio: false,
     preprocessText: true
   });
+});
+
+test('G10: background.js imports constants.js and has no default URL or voice of its own', () => {
+  const source = read('background.js');
+  assert.match(source.split('\n')[0], /^importScripts\(.*'constants\.js'.*\);$/);
+  assert.ok(!/DEFAULT_SERVER_URL/.test(source), 'no private DEFAULT_SERVER_URL');
+  assert.ok(!/localhost:8000/.test(source), 'no port-8000 URL');
+  assert.ok(!/af_bella/.test(source), 'no hard-coded voice');
 });
 
 test('F1: the fetch body keys are exactly model, voice, input, speed; voice and speed come from the session settings', async () => {
@@ -93,7 +101,8 @@ test('F4: no sendBeacon, XHR, socket or extra fetch anywhere in the extension co
     'background.js': read('background.js'),
     'offscreen.js': read('offscreen.js'),
     'popup.js': read('popup.js'),
-    'lib/playback.js': read('lib/playback.js')
+    'lib/playback.js': read('lib/playback.js'),
+    'lib/voices.js': read('lib/voices.js')
   };
   for (const [file, source] of Object.entries(sources)) {
     const text = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''); // comments may mention fetch()
@@ -101,6 +110,48 @@ test('F4: no sendBeacon, XHR, socket or extra fetch anywhere in the extension co
     const fetchCalls = (text.match(/\bfetch\s*\(/g) || []).length;
     assert.equal(fetchCalls, file === 'background.js' ? 1 : 0, `${file} fetch() calls`);
   }
+});
+
+test('F7: the voices request has one call site (popup.js -> TTSVoices.checkVoices -> doFetch), a plain GET with only a signal', () => {
+  const strip = (source) => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const popup = strip(read('popup.js'));
+  const voices = strip(read('lib/voices.js'));
+  assert.equal((popup.match(/TTSVoices\.checkVoices\(/g) || []).length, 1, 'popup.js asks for the voices in one place');
+  assert.equal((voices.match(/\bdoFetch\(/g) || []).length, 1, 'lib/voices.js makes one request');
+  assert.ok(voices.includes('doFetch(url, { signal: controller.signal })'), 'the only init field is the abort signal');
+  assert.ok(!/headers|Authorization|Bearer|method\s*:/i.test(voices), 'no headers, no auth, no method override');
+  assert.ok(!/headers|Authorization|Bearer/i.test(popup), 'popup.js adds no headers or auth');
+});
+
+test('F4: nothing about the voice list is stored: no new chrome.storage key, and no storage call in lib/voices.js', () => {
+  const voices = read('lib/voices.js');
+  assert.ok(!/chrome\./.test(voices.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')), 'lib/voices.js touches no chrome.* API');
+  const popup = read('popup.js');
+  const keys = new Set([...popup.matchAll(/chrome\.storage\.local\.set\(\{\s*(\w+)/g)].map((m) => m[1]));
+  assert.deepEqual([...keys].sort(), ['voice']);
+  assert.ok(/chrome\.storage\.local\.set\(settings\)/.test(popup), 'the settings save is unchanged');
+});
+
+test('F5: no table from Kokoro ids to Chatterbox files in lib/voices.js, popup.js or background.js', () => {
+  for (const file of ['lib/voices.js', 'popup.js', 'background.js']) {
+    const text = read(file);
+    assert.ok(!/am_adam|af_nicole|bf_emma|af_sarah|bm_george|bf_isabella|am_michael|af_sky/.test(text), `${file} lists no Kokoro voices`);
+    assert.ok(!/\.wav['\"]/.test(text), `${file} names no voice files`);
+    const bella = (text.match(/af_bella/g) || []).length;
+    assert.equal(bella, file === 'lib/voices.js' ? 1 : 0, `${file}: af_bella appears only as the one old-default constant`);
+  }
+  assert.ok(/OLD_DEFAULT_VOICE = 'af_bella';/.test(read('lib/voices.js')));
+});
+
+test('F6: popup.html gains no button beyond the connection light', () => {
+  const html = read('popup.html');
+  const buttons = [...html.matchAll(/<button\b[^>]*>/g)].map((m) => m[0].match(/id="([^"]+)"/)[1]);
+  assert.deepEqual(buttons, ['playBtn', 'pauseBtn', 'stopBtn', 'downloadBtn', 'connLight', 'downloadLogBtn', 'clearLogBtn']);
+  assert.ok(!/<option\b/.test(html), 'the static Kokoro options are gone');
+  const scripts = [...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]);
+  assert.deepEqual(scripts, [
+    '<script src="audioPlayer.js">', '<script src="constants.js">', '<script src="lib/voices.js">', '<script src="popup.js">'
+  ]);
 });
 
 test('F4: popup.html gains no checkbox or toggle for logging', () => {

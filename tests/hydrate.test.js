@@ -98,10 +98,25 @@ test('E7: hydrate reads storage.session and chrome.tabs.get; with nothing stored
   assert.equal(await playerState(bg), 'stopped');
 });
 
-test('E7: the serverUrl is not stored; it comes from chrome.storage.local, with the default when none is saved', async () => {
+test('E7: the serverUrl is not stored; it comes from chrome.storage.local, with the shared default when none is saved', async () => {
   const { bg } = startWorker({ local: {} });
   await settle();
-  assert.equal(liveSession(bg).settings.serverUrl, 'http://localhost:8000/v1/audio/speech');
+  assert.equal(liveSession(bg).settings.serverUrl, 'http://localhost:8090/v1/audio/speech');
+  assert.equal(liveSession(bg).settings.serverUrl, require('../constants.js').DEFAULT_SETTINGS.serverUrl);
+});
+
+test('G10: a stored old port-8000 default counts as unset when a session is rebuilt; another stored URL is kept', async () => {
+  const old = startWorker({ local: { serverUrl: 'http://localhost:8000/v1/audio/speech' } });
+  await settle();
+  assert.equal(liveSession(old.bg).settings.serverUrl, 'http://localhost:8090/v1/audio/speech');
+
+  const empty = startWorker({ local: { serverUrl: '' } });
+  await settle();
+  assert.equal(liveSession(empty.bg).settings.serverUrl, 'http://localhost:8090/v1/audio/speech');
+
+  const custom = startWorker({ local: { serverUrl: 'http://tts.example.invalid:9999/v1/audio/speech' } });
+  await settle();
+  assert.equal(liveSession(custom.bg).settings.serverUrl, 'http://tts.example.invalid:9999/v1/audio/speech');
 });
 
 // --- The first message sees the hydrated state ---------------------------------------------------------

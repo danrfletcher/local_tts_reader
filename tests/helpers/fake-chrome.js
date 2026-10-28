@@ -322,6 +322,21 @@ function okResponse(bytes, type = 'audio/wav') {
   };
 }
 
+/** A response with a JSON body (`json()` resolves to `body`). */
+function jsonResponse(body, status = 200) {
+  return { ok: status >= 200 && status < 300, status, json: async () => clone(body), text: async () => JSON.stringify(body) };
+}
+
+/** A response whose body is not JSON (`json()` rejects, as it does for HTML or text). */
+function textResponse(text, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => { throw new SyntaxError('Unexpected token < in JSON'); },
+    text: async () => text
+  };
+}
+
 function defaultResponder({ body }) {
   return okResponse(audioBytesFor(body.input));
 }
@@ -388,6 +403,8 @@ module.exports = {
   createFakeFetch,
   audioBytesFor,
   okResponse,
+  jsonResponse,
+  textResponse,
   hangUntilAbort,
   runScript,
   loadBackground

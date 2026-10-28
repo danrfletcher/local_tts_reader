@@ -1,4 +1,4 @@
-importScripts('textProcessor.js', 'lib/playback.js');
+importScripts('constants.js', 'textProcessor.js', 'lib/voices.js', 'lib/playback.js');
 
 let currentPlayerState = 'stopped';
 let creating = null; // A global promise to avoid concurrency issues
@@ -48,7 +48,6 @@ const SUBSEQUENT_CHUNK_TIMEOUT_MS = 18000; // warm backend: ~1-2s typical
 const KEEPALIVE_ALARM_NAME = 'tts-reader-keepalive';
 const MIN_READABLE_FRAME_LENGTH = 200;
 const FRAME_PREFERENCE_MARGIN = 200;
-const DEFAULT_SERVER_URL = 'http://localhost:8000/v1/audio/speech';
 
 // --- Session state kept across service-worker restarts -------------------
 // Chrome stops the worker when it is idle and may restart it while a session
@@ -134,12 +133,12 @@ async function hydrateSession() {
 
   let serverUrl;
   try {
-    ({ serverUrl } = await chrome.storage.local.get({ serverUrl: DEFAULT_SERVER_URL }));
+    ({ serverUrl } = await chrome.storage.local.get({ serverUrl: DEFAULT_SETTINGS.serverUrl }));
   } catch (_error) {
     discardStoredSession('settings-failed');
     return null;
   }
-  if (typeof serverUrl !== 'string' || serverUrl === '') serverUrl = DEFAULT_SERVER_URL;
+  serverUrl = TTSVoices.normalizeServerUrl(serverUrl, DEFAULT_SETTINGS.serverUrl); // an old stored default counts as unset
 
   if (session) return null; // a session exists already; never replace it with an old one
 
@@ -316,12 +315,13 @@ async function startReadingFromTab(tabId, frameId) {
   try {
     await ensureHydrated(); // a restarted worker's paused session is replaced like any other
     const settings = await chrome.storage.local.get({
-      serverUrl: DEFAULT_SERVER_URL,
-      voice: 'af_bella',
-      speed: 1.0,
-      recordAudio: false,
-      preprocessText: true
+      serverUrl: DEFAULT_SETTINGS.serverUrl,
+      voice: DEFAULT_SETTINGS.voice,
+      speed: DEFAULT_SETTINGS.speed,
+      recordAudio: DEFAULT_SETTINGS.recordAudio,
+      preprocessText: DEFAULT_SETTINGS.preprocessText
     });
+    settings.serverUrl = TTSVoices.normalizeServerUrl(settings.serverUrl, DEFAULT_SETTINGS.serverUrl); // an old stored default counts as unset
     if (!startTokens.isCurrent(token)) {
       logSupersededStart('queued');
       return;

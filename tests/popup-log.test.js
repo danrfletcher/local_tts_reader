@@ -76,7 +76,8 @@ function loadPopup({ sendMessage, playerInitFails = false } = {}) {
       async getSessionState() { return { active: false, sessionId: null, paused: false, index: 0, total: 0 }; }
       async getTimeInfo() { return null; }
     },
-    DEFAULT_SETTINGS: { serverUrl: 'x', voice: 'v', speed: 1, recordAudio: false, preprocessText: true },
+    DEFAULT_SETTINGS: { serverUrl: 'x', voice: '', speed: 1, recordAudio: false, preprocessText: true },
+    AbortController,
     Blob,
     URL: {
       createObjectURL(blob) { blobs.push(blob); return `blob:fake-${blobs.length}`; },
@@ -89,7 +90,9 @@ function loadPopup({ sendMessage, playerInitFails = false } = {}) {
     console: { error() {}, log() {}, warn() {} }
   };
   const context = vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync(path.join(ROOT, 'popup.js'), 'utf8'), context, { filename: 'popup.js' });
+  for (const file of ['lib/voices.js', 'popup.js']) {
+    vm.runInContext(fs.readFileSync(path.join(ROOT, file), 'utf8'), context, { filename: file });
+  }
   assert.equal(domListeners.length, 1, 'popup.js registers one DOMContentLoaded handler');
   const ready = Promise.resolve(domListeners[0]()).catch(() => {});
   return { getEl, anchors, blobs, body, sentMessages, ready, status: () => getEl('status') };
