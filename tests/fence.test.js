@@ -123,6 +123,47 @@ test('F7: the voices request has one call site (popup.js -> TTSVoices.checkVoice
   assert.ok(!/headers|Authorization|Bearer/i.test(popup), 'popup.js adds no headers or auth');
 });
 
+test('F3: no polling timer. popup.js has the one seek-bar setInterval; connection checks use only the 500 ms debounce, the 3 s label timer and the 90 s timeout', () => {
+  const strip = (source) => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const popup = strip(read('popup.js'));
+  const voices = strip(read('lib/voices.js'));
+
+  assert.equal((popup.match(/\bsetInterval\s*\(/g) || []).length, 1, 'popup.js: only the seek-bar setInterval');
+  assert.match(popup, /const updateInterval = setInterval\(async \(\) => \{\s*if \(!audioPlayer\) return;\s*const state = await audioPlayer\.getState\(\);/);
+  assert.ok(!/\bsetInterval\s*\(/.test(voices), 'lib/voices.js has no setInterval');
+  assert.ok(!/chrome\.alarms/.test(popup) && !/chrome\.alarms/.test(voices), 'no chrome.alarms in the popup or voices module');
+
+  // The only setTimeout calls in popup.js: the status fade (3 s), the log URL
+  // revoke, and the two connection timers (both cleared on restart and on close).
+  const timeouts = [...popup.matchAll(/(\w+\s*=\s*)?setTimeout\(/g)].map((m) => (m[1] || '').replace(/\s*=\s*$/, ''));
+  assert.deepEqual(timeouts.sort(), ['', '', 'startingTimer', 'urlCheckTimer']);
+  assert.match(popup, /startingTimer = setTimeout\([\s\S]*?\}, TTSVoices\.STARTING_AFTER_MS\);/);
+  assert.match(popup, /urlCheckTimer = setTimeout\([\s\S]*?\}, URL_CHECK_DEBOUNCE_MS\);/);
+  assert.match(popup, /const URL_CHECK_DEBOUNCE_MS = 500;/);
+  assert.match(popup, /function cancelConnectionCheck\(\) \{\s*clearTimeout\(urlCheckTimer\);[\s\S]*?clearTimeout\(startingTimer\);[\s\S]*?checkController\.abort\(\);/);
+  assert.match(popup, /window\.addEventListener\('pagehide', cancelConnectionCheck\)/);
+  assert.match(popup, /async function runConnectionCheck\(\) \{\s*cancelConnectionCheck\(\);/);
+
+  const { STARTING_AFTER_MS, VOICES_TIMEOUT_MS } = require('../lib/voices.js');
+  assert.equal(STARTING_AFTER_MS, 3000);
+  assert.equal(VOICES_TIMEOUT_MS, 90000);
+  assert.equal((voices.match(/\bsetTimer\(/g) || []).length, 1, 'one timeout, the 90 s cap');
+  assert.equal((voices.match(/\bclearTimer\(/g) || []).length, 1, 'cleared in finally');
+});
+
+test('F3: the three triggers are the only callers of a check: open, Server URL input (debounced) and the light', () => {
+  const strip = (source) => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const popup = strip(read('popup.js'));
+  const callers = [...popup.matchAll(/\brunConnectionCheck\(\)/g)].length;
+  // definition + scheduleConnectionCheck's timer + the light's recheck + the first check on open
+  assert.equal(callers, 4);
+  assert.match(popup, /addEventListener\('input', scheduleConnectionCheck\)/);
+  assert.match(popup, /connLight\.addEventListener\('click', recheckNow\)/);
+  assert.match(popup, /connLight\.addEventListener\('keydown'/);
+  assert.ok(!/addEventListener\('(change|blur|focus|keyup)', (scheduleConnectionCheck|runConnectionCheck|recheckNow)/.test(popup));
+  assert.ok(!/visibilitychange|onfocus|storage\.onChanged/.test(popup), 'no other trigger');
+});
+
 test('F4: nothing about the voice list is stored: no new chrome.storage key, and no storage call in lib/voices.js', () => {
   const voices = read('lib/voices.js');
   assert.ok(!/chrome\./.test(voices.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')), 'lib/voices.js touches no chrome.* API');
@@ -152,6 +193,13 @@ test('F6: popup.html gains no button beyond the connection light', () => {
   assert.deepEqual(scripts, [
     '<script src="audioPlayer.js">', '<script src="constants.js">', '<script src="lib/voices.js">', '<script src="popup.js">'
   ]);
+});
+
+test('PR-2: popup.html has the hidden Voice name group (a labelled text input) and the light is a focusable button with role status', () => {
+  const html = read('popup.html');
+  assert.match(html, /<div class="setting-group" id="voiceNameGroup" hidden>\s*<label for="voiceName">Voice name<\/label>\s*<input type="text" id="voiceName"[^>]*>/);
+  assert.match(html, /<button type="button" id="connLight" class="conn-light connIdle" role="status" title="[^"]*"><\/button>/);
+  assert.ok(!/<select[^>]*id="voiceName"/.test(html));
 });
 
 test('F4: popup.html gains no checkbox or toggle for logging', () => {
