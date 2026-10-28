@@ -240,6 +240,53 @@
       background-color: #e94560;
     }
 
+    [hidden] {
+      display: none !important;
+    }
+
+    .conn-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+      min-height: 16px;
+    }
+
+    /* The connection light: grey while idle or checking, green when the
+       server answered with voices, amber when it answered without a list,
+       red when it could not be used. */
+    .conn-light {
+      flex: none;
+      width: 14px;
+      height: 14px;
+      padding: 0;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 50%;
+      background-color: #888;
+      cursor: pointer;
+    }
+
+    .conn-light.connOk { background-color: #2ecc71; }
+    .conn-light.connNoList,
+    .conn-light.connNoVoices { background-color: #f1c40f; }
+    .conn-light.connFailed { background-color: #e74c3c; }
+
+    .conn-light:focus-visible {
+      outline: 2px solid #e6e6e6;
+      outline-offset: 2px;
+    }
+
+    .conn-label {
+      font-size: 12px;
+      color: #ccc;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    #voice:disabled {
+      opacity: 0.5;
+    }
+
     #status {
       margin-top: 15px;
       padding: 10px;
@@ -298,19 +345,15 @@
   </div>
 
   <div class="settings-panel">
-    <div class="setting-group">
+    <div class="setting-group" id="voiceGroup" hidden>
       <label for="voice">Voice</label>
-      <select id="voice">
-        <option value="am_adam">Adam (Alloy)</option>
-        <option value="af_nicole">Nicole (Ash)</option>
-        <option value="bf_emma">Emma (Coral)</option>
-        <option value="af_bella">Bella (Echo)</option>
-        <option value="af_sarah">Sarah (Fable)</option>
-        <option value="bm_george">George (Onyx)</option>
-        <option value="bf_isabella">Isabella (Nova)</option>
-        <option value="am_michael">Michael (Sage)</option>
-        <option value="af_sky">Sky (Shimmer)</option>
-      </select>
+      <select id="voice"></select>
+      <div class="helper-text" id="voiceNote" hidden></div>
+    </div>
+
+    <div class="setting-group" id="voiceNameGroup" hidden>
+      <label for="voiceName">Voice name</label>
+      <input type="text" id="voiceName" autocomplete="off" spellcheck="false">
     </div>
 
     <div class="setting-group">
@@ -340,6 +383,10 @@
 
     <div class="setting-group">
       <label for="serverUrl">Server URL</label>
+      <div class="conn-row">
+        <button type="button" id="connLight" class="conn-light connIdle" role="status" title="Not checked yet"></button>
+        <span id="connLabel" class="conn-label"></span>
+      </div>
       <input type="text" id="serverUrl">
     </div>
 
@@ -357,6 +404,7 @@
 
   <script src="audioPlayer.js"></script>
   <script src="constants.js"></script>
+  <script src="lib/voices.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

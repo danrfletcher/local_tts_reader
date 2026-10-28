@@ -433,7 +433,7 @@ test('E8: playChunk or chunkEnded carrying a replaced session id is dropped and 
 
 test('E8: a play that was waiting on the prefetch when its session was replaced never reaches playChunk, and is logged', async () => {
   const slow = deferred();
-  const fetchFn = createFakeFetch(({ call, body }) => (call === 2 ? slow.promise : okResponse(audioBytesFor(body.input))));
+  const fetchFn = createFakeFetch(({ call, body }) => (call === 2 ? slow.promise : okResponse(audioBytesFor(body.input))), { voices: true });
   const bg = loadBackground({ sentences: SENTENCES, fetch: fetchFn });
   await startRead(bg);
   const oldChunk = playChunks(bg)[0];
@@ -456,7 +456,7 @@ test('E8: a play that was waiting on the prefetch when its session was replaced 
 
 test('GP5: Read Aloud on a selection while playing stops the old session, aborts its fetches, reads the selection once, and ignores the old session\'s late messages', async () => {
   const fetchFn = createFakeFetch(({ call, signal, body }) =>
-    (call === 2 ? hangUntilAbort(signal) : okResponse(audioBytesFor(body.input))));
+    (call === 2 ? hangUntilAbort(signal) : okResponse(audioBytesFor(body.input))), { voices: true });
   const bg = loadBackground({ sentences: SENTENCES, fetch: fetchFn });
   const original = bg.chrome.scripting.executeScript;
   let selecting = false;

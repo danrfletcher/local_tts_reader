@@ -5,6 +5,169 @@ let currentAudioUrl = null;
 // opens; Pause is only offered during starting/loading once one exists.
 let activeSessionId = null;
 
+// --- Connection light and voice list -------------------------------------
+// The popup asks the connected server for its voices (lib/voices.js) when it
+// opens, 500 ms after the Server URL is edited, and on a click (or Enter) on
+// the light. There is no polling. Nothing is cached or
+// stored: a new popup always checks again. The connection states (conn*) and
+// their label are separate from the player's own 'starting' state and its
+// overlay (updateControlButtons); the label is hidden while a session is
+// active so the two never say "Starting voice engine" at once.
+const CONN = TTSVoices.CONN;
+const URL_CHECK_DEBOUNCE_MS = 500;
+let connState = CONN.IDLE;
+let connReason = '';
+let voiceListShown = false; // the Voice box is visible (a green list, possibly mid re-check)
+let voiceNameShown = false; // the "Voice name" text input is visible (amber: no voice list)
+let voiceNote = '';
+// The voice the user last picked or typed (or that was stored); '' means
+// "first voice". It is only ever changed by the user: picking from the list or
+// typing a name. A reconcile, a failed or stale check and saving other
+// settings never write `voice`.
+let savedVoice = '';
+let checkController = null;
+let checkSeq = 0;
+let startingTimer = null;
+let urlCheckTimer = null;
+// What the player state alone says about Play; the connection gate is applied on top.
+let playAllowedByPlayer = true;
+
+// The connection's half of the Play gate: connOk, or connNoList with a
+// non-empty voice name (read from whichever voice element is live).
+function connectionGateOpen() {
+  return TTSVoices.connectionAllowsPlay(connState, currentVoice());
+}
+
+// Play is enabled only when the player state (session gate) and the
+// connection gate both allow it.
+function refreshPlayGate() {
+  document.getElementById('playBtn').disabled = !playAllowedByPlayer || !connectionGateOpen();
+}
+
+function renderConnection(sessionActive = activeSessionId !== null) {
+  const light = document.getElementById('connLight');
+  const label = document.getElementById('connLabel');
+  const voiceGroup = document.getElementById('voiceGroup');
+  const voiceEl = document.getElementById('voice');
+  const noteEl = document.getElementById('voiceNote');
+  const text = connReason || TTSVoices.STATE_TEXT[connState] || '';
+
+  light.className = `conn-light ${connState}`;
+  light.title = text || 'Not checked yet';
+  label.textContent = text;
+  label.hidden = sessionActive || text === '';
+
+  voiceGroup.hidden = !voiceListShown;
+  voiceEl.disabled = connState !== CONN.OK; // a re-check keeps the old list, but not usable
+  // The Voice name box is never disabled or rewritten here: the user may be
+  // typing in it while a check lands.
+  document.getElementById('voiceNameGroup').hidden = !voiceNameShown;
+  noteEl.textContent = voiceNote;
+  noteEl.hidden = voiceNote === '';
+
+  refreshPlayGate();
+}
+
+function fillVoiceSelect(voices, selectedId) {
+  const voiceEl = document.getElementById('voice');
+  const options = voices.map((voice) => {
+    const option = document.createElement('option');
+    option.value = voice.id; // the raw id is what is sent to the server
+    option.textContent = voice.label;
+    return option;
+  });
+  voiceEl.replaceChildren(...options);
+  voiceEl.value = selectedId;
+}
+
+function applyCheckResult(result) {
+  connState = result.state;
+  connReason = result.reason || '';
+  if (result.state === CONN.OK) {
+    const pick = TTSVoices.reconcileVoice(savedVoice, result.voices);
+    fillVoiceSelect(result.voices, pick.voice);
+    voiceNote = pick.note; // cleared here when the saved voice is on the list; not written anywhere
+    voiceListShown = true;
+    voiceNameShown = false;
+  } else {
+    voiceListShown = false;
+    voiceNote = '';
+    // No voice list (404/405, or no derivable address): the Voice name box
+    // takes the Voice box's place. It is prefilled with the saved voice only
+    // when it appears; if it is already showing (a re-check) it keeps what
+    // the user typed, so a result never moves the caret or clears the text.
+    const showName = result.state === CONN.NO_LIST;
+    if (showName && !voiceNameShown) document.getElementById('voiceName').value = savedVoice;
+    voiceNameShown = showName;
+  }
+  renderConnection();
+}
+
+function cancelConnectionCheck() {
+  clearTimeout(urlCheckTimer);
+  urlCheckTimer = null;
+  clearTimeout(startingTimer);
+  startingTimer = null;
+  if (checkController) checkController.abort();
+  checkController = null;
+}
+
+// One check at a time: a new one aborts the running one, and only the latest
+// check's result is applied (an aborted fetch is silent).
+async function runConnectionCheck() {
+  cancelConnectionCheck();
+  const controller = new AbortController();
+  checkController = controller;
+  const seq = ++checkSeq;
+
+  connState = CONN.CHECKING;
+  connReason = '';
+  renderConnection(); // the Voice box (or Voice name box) stays only if it was showing; the list is disabled
+  startingTimer = setTimeout(() => {
+    if (seq === checkSeq && connState === CONN.CHECKING) {
+      connState = CONN.STARTING;
+      renderConnection();
+    }
+  }, TTSVoices.STARTING_AFTER_MS);
+
+  let result;
+  try {
+    result = await TTSVoices.checkVoices({
+      serverUrl: document.getElementById('serverUrl').value,
+      signal: controller.signal
+    });
+  } catch (error) {
+    console.error('Error checking the voices:', error);
+    result = { state: CONN.FAILED, reason: TTSVoices.REASONS.UNREACHABLE, voices: [] };
+  }
+  if (seq !== checkSeq || result.aborted) return;
+  clearTimeout(startingTimer);
+  startingTimer = null;
+  checkController = null;
+  applyCheckResult(result);
+}
+
+// Every edit aborts the running check at once (not only when the debounce
+// fires), so a check for the old URL cannot land while the box shows a new one.
+// Bumping checkSeq drops a result that already resolved. The light stays as it
+// was (Checking... if a check was running) until the debounced check starts.
+function scheduleConnectionCheck() {
+  cancelConnectionCheck();
+  checkSeq++;
+  urlCheckTimer = setTimeout(() => {
+    urlCheckTimer = null;
+    runConnectionCheck().catch((error) => console.error('Error checking the voices:', error));
+  }, URL_CHECK_DEBOUNCE_MS);
+}
+
+// The voice a new session would use, read from whichever element is live: the
+// typed name while the Voice name box shows, the picked option while the list
+// shows, otherwise the stored one.
+function currentVoice() {
+  if (voiceNameShown) return document.getElementById('voiceName').value;
+  return voiceListShown ? document.getElementById('voice').value : savedVoice;
+}
+
 // Play resumes a paused session, starts a new one only when there is no live
 // session (never started, stopped, or finished), and does nothing for a live
 // session that is not paused (it is already reading or about to). The choice
@@ -141,22 +304,49 @@ function updateControlButtons(state, sessionActive = activeSessionId !== null) {
       downloadBtn.disabled = true;
       seekBar.disabled = true;
   }
+
+  // The player state decides Play first; the connection gate can only close it.
+  playAllowedByPlayer = !playBtn.disabled;
+  renderConnection(sessionActive);
 }
 
 function getSettings() {
   return {
     serverUrl: document.getElementById('serverUrl').value,
-    voice: document.getElementById('voice').value,
+    voice: currentVoice(),
     speed: document.getElementById('speed').value,
     recordAudio: document.getElementById('recordAudio').checked,
     preprocessText: document.getElementById('preprocessText').checked
   };
 }
 
+// Saves everything except `voice`, which is written only when the user picks
+// one (saveVoice): the voice shown may be a reconcile, not a choice.
 async function saveSettings() {
-  const settings = getSettings();
+  const { voice: _voice, ...settings } = getSettings();
   await chrome.storage.local.set(settings);
   updateStatus('Settings saved!', false);
+}
+
+async function saveVoice() {
+  savedVoice = document.getElementById('voice').value;
+  voiceNote = '';
+  renderConnection();
+  await chrome.storage.local.set({ voice: savedVoice });
+  updateStatus('Settings saved!', false);
+}
+
+// The typed Voice name saves on every `input` (the only other write of
+// `voice` besides a pick). Play follows the box at once: enabled only while
+// it is non-empty.
+async function saveTypedVoice() {
+  savedVoice = document.getElementById('voiceName').value;
+  refreshPlayGate();
+  try {
+    await chrome.storage.local.set({ voice: savedVoice });
+  } catch (error) {
+    console.error('Error saving the voice name:', error);
+  }
 }
 
 // Format time in seconds to MM:SS format
@@ -227,26 +417,50 @@ document.addEventListener('DOMContentLoaded', async function() {
   document.getElementById('downloadLogBtn').addEventListener('click', downloadDebugLog);
   document.getElementById('clearLogBtn').addEventListener('click', clearDebugLog);
 
-  // Initialize audio player
-  audioPlayer = new AudioPlayer();
-  await audioPlayer.init();
-  
-  // Load saved settings
-  chrome.storage.local.get({
+  // A click on the light re-checks at once (and restarts a running check).
+  // Enter does the same; preventDefault stops the browser's own Enter-click
+  // from checking a second time.
+  const connLight = document.getElementById('connLight');
+  const recheckNow = () => {
+    runConnectionCheck().catch((error) => console.error('Error checking the voices:', error));
+  };
+  connLight.addEventListener('click', recheckNow);
+  connLight.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    recheckNow();
+  });
+
+  document.getElementById('voiceName').addEventListener('input', saveTypedVoice);
+
+  // Closed popup: give up on the check (a new popup starts a fresh one).
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pagehide', cancelConnectionCheck);
+  }
+
+  // Load saved settings, then check the server they point at. The Voice box
+  // stays hidden and Play disabled until that check succeeds.
+  renderConnection();
+  const result = await new Promise((resolve) => chrome.storage.local.get({
     serverUrl: DEFAULT_SETTINGS.serverUrl,
     voice: DEFAULT_SETTINGS.voice,
     speed: DEFAULT_SETTINGS.speed,
     recordAudio: DEFAULT_SETTINGS.recordAudio,
     preprocessText: DEFAULT_SETTINGS.preprocessText
-  }, function(result) {
-    document.getElementById('serverUrl').value = result.serverUrl;
-    document.getElementById('voice').value = result.voice;
-    document.getElementById('speed').value = result.speed;
-    document.getElementById('recordAudio').checked = result.recordAudio;
-    document.getElementById('preprocessText').checked = result.preprocessText;
-    document.querySelector('.speed-value').textContent = `${result.speed}x`;
-  });
-  
+  }, resolve));
+  // A stored copy of the old port-8000 default counts as unset.
+  document.getElementById('serverUrl').value = TTSVoices.normalizeServerUrl(result.serverUrl, DEFAULT_SETTINGS.serverUrl);
+  savedVoice = typeof result.voice === 'string' ? result.voice : '';
+  document.getElementById('speed').value = result.speed;
+  document.getElementById('recordAudio').checked = result.recordAudio;
+  document.getElementById('preprocessText').checked = result.preprocessText;
+  document.querySelector('.speed-value').textContent = `${result.speed}x`;
+  runConnectionCheck().catch((error) => console.error('Error checking the voices:', error));
+
+  // Initialize audio player
+  audioPlayer = new AudioPlayer();
+  await audioPlayer.init();
+
   // Sync player state
   syncPlayerState().catch((error) => console.error('Error syncing player state:', error));
   
@@ -280,6 +494,9 @@ document.addEventListener('DOMContentLoaded', async function() {
   
   // Play button
   document.getElementById('playBtn').addEventListener('click', async function() {
+    // The disabled attribute is not the only guard: a closed connection gate
+    // (red, grey, amber-empty, blank voice name) sends nothing.
+    if (!connectionGateOpen()) return;
     try {
       const sessionState = await audioPlayer.getSessionState();
       const action = playButtonAction(sessionState);
@@ -347,10 +564,14 @@ document.addEventListener('DOMContentLoaded', async function() {
     }
   });
   
-  // Save settings
-  ['serverUrl', 'voice', 'speed', 'recordAudio', 'preprocessText'].forEach(id => {
+  // Save settings (never the voice; see saveSettings)
+  ['serverUrl', 'speed', 'recordAudio', 'preprocessText'].forEach(id => {
     document.getElementById(id).addEventListener('change', saveSettings);
   });
+  document.getElementById('voice').addEventListener('change', saveVoice);
+
+  // The Server URL is checked while typing (debounced); saving stays on `change`.
+  document.getElementById('serverUrl').addEventListener('input', scheduleConnectionCheck);
   
   // Listen for messages from background script
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

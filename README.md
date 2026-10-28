@@ -15,7 +15,9 @@ A sleek Chrome extension that converts webpage text to speech using a local Open
   and uses a longer timeout for the first request of a session, since
   some local TTS backends (e.g. a sleeping llama-swap/Chatterbox
   process) can take up to ~30s to wake up
-- 🎭 Multiple voice options compatible with OpenAI voice mappings
+- 🎭 Voices come from the server you connect to: the popup asks its voices
+  endpoint and lists what it offers, with a traffic light showing whether the
+  server is reachable
 - ⚡ Adjustable playback speed (0.25x to 4.0x)
 - 💾 Option to save audio for download
 - ⏯️ Play/Pause/Stop/Seek controls
@@ -40,10 +42,13 @@ git clone https://github.com/phildougherty/local_tts_reader.git
 
 1. Click the extension icon in your Chrome toolbar
 2. Configure your settings:
-   - Select your preferred voice
+   - Enter your local TTS server URL (it opens on
+     `http://localhost:8090/v1/audio/speech`) and wait for the light beside it
+     to turn green
+   - Select your preferred voice (the Voice box appears once the light is
+     green; see "Connection light and voices" below)
    - Adjust the playback speed using the slider
    - Check "Save audio for download" if you want to download the audio
-   - Enter your local TTS server URL
 
 3. On any webpage:
    - Select specific text to read just that portion
@@ -52,29 +57,73 @@ git clone https://github.com/phildougherty/local_tts_reader.git
    - Use pause/stop controls as needed
    - Download the audio if recording was enabled
 
-## Voice Options
+## Connection light and voices
 
-The extension supports the following voices:
-- Adam (Alloy) - `am_adam`
-- Nicole (Ash) - `af_nicole`
-- Emma (Coral) - `bf_emma`
-- Bella (Echo) - `af_bella`
-- Sarah (Fable) - `af_sarah`
-- George (Onyx) - `bm_george`
-- Isabella (Nova) - `bf_isabella`
-- Michael (Sage) - `am_michael`
-- Sky (Shimmer) - `af_sky`
+The extension has no built-in voice list. Next to the Server URL a small light
+shows what the server answered, and the Voice box is filled from that answer.
+
+The check is one plain `GET /v1/audio/voices?model=tts-1` against the server,
+at the address derived from the Server URL by replacing the trailing
+`/audio/speech` with `/audio/voices` and adding `?model=tts-1`. For the default
+URL that is `http://localhost:8090/v1/audio/voices?model=tts-1`. It runs when the popup
+opens, 500 ms after you stop editing the Server URL, and when you click the
+light. There is no polling, and the voice list is never stored.
+
+Two response shapes are accepted: `{"voices": [...]}` (what llama-swap in front
+of Chatterbox returns, e.g. `{"status":"ok","voices":["Olivia.wav", ...]}`) and a
+bare array `[...]`. Entries are strings, or objects read by `id`, then `name`,
+then `voice`. Empty and duplicate entries are dropped and the server's order is
+kept. A trailing `.wav`, `.mp3`, `.flac` or `.ogg` is left off the label
+(`Olivia.wav` shows as Olivia), but the raw name is what is sent to the server.
+A server that answers 404 or 405 has no voices endpoint, which counts as
+"connected, no voice list".
+
+The light's states:
+
+- Grey, "Checking...": a check is running.
+- Grey, "Starting voice engine...": the check has been running for more than
+  3 seconds. A sleeping backend (e.g. llama-swap unloading the model after idle)
+  can take about 30 s to wake, and the check waits up to 90 s before it turns red.
+- Green, "Connected": the server answered with at least one voice. The Voice box
+  shows the list and Play is enabled.
+- Amber, "Connected, no voice list": the server has no voices endpoint (404 or
+  405), or the Server URL does not end in `/audio/speech` ("Can't derive a voices
+  address"). The Voice box is replaced by a "Voice name" text box, which is
+  what is sent; Play is enabled while it is not empty.
+- Amber, "Server has no voices": the server answered but its list is empty. Play
+  is disabled.
+- Red: the Voice box is hidden and Play is disabled. The reason is one of
+  "Can't reach server - is it running?" (any network failure), "Not authorised
+  (401)" or "(403)", "Server error N" for any other non-200 answer, "Unexpected
+  response" for a 200 that is not a voices list, or "Timed out - click the light
+  to retry" after 90 s.
+
+A saved voice that the server no longer offers is replaced on screen by the
+first voice, with a one-line note; nothing is saved until you pick a voice or
+type a name.
+
+Right-click "Read Aloud" does not open the popup, so it makes the same check
+itself before each read: it stops any current reading, shows "Starting voice
+engine...", asks the voices endpoint once (up to 90 s) and sends your saved
+voice if the server offers it, otherwise the first voice. If the server has no
+voice list the saved voice is sent as it is; if the check fails the read starts
+with the saved voice and any error shows as usual. With no saved voice and no
+list, no read starts and it says "No voice selected - open the popup". This
+check never changes your saved settings.
 
 ## Server Requirements
 
 Your local TTS server should:
 - Be OpenAI API compatible
 - Accept POST requests to `/v1/audio/speech`
+- Ideally also answer `GET /v1/audio/voices?model=tts-1` with the voices it
+  offers (see "Connection light and voices"); without it the extension still
+  works, with a typed voice name
 - Accept JSON payload in the format:
 \\```json
 {
   "model": "tts-1",
-  "voice": "af_bella",
+  "voice": "Olivia.wav",
   "input": "text to speak",
   "speed": 1.0
 }
@@ -85,7 +134,9 @@ Note: the extension now sends one request **per sentence** rather than
 one request for the whole selection (see "How reading works" below), so
 `input` will typically be a single sentence, not a full paragraph.
 
-Default server URL: `http://localhost:8000/v1/audio/speech`
+Default server URL: `http://localhost:8090/v1/audio/speech` (the voice sent
+in the example above, `Olivia.wav`, is one of a Chatterbox server's voice files;
+use a name your own server offers)
 
 ## How reading works
 

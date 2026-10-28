@@ -1,6 +1,7 @@
 const DEFAULT_SETTINGS = {
-    serverUrl: 'http://localhost:8000/v1/audio/speech',
-    voice: 'af_bella',
+    serverUrl: 'http://localhost:8090/v1/audio/speech',
+    // Empty means "the first voice the connected server offers".
+    voice: '',
     speed: 1.0,
     recordAudio: false,
     preprocessText: true

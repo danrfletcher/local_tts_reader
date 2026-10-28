@@ -3,10 +3,22 @@
 /**
  * Fake OpenAI-compatible TTS server for container / manual checks.
  *
- *   node tests/fixtures/fake-tts-server.js            # port 8000 (the extension default)
+ *   node tests/fixtures/fake-tts-server.js            # port 8090 (the extension default)
  *   PORT=18765 node tests/fixtures/fake-tts-server.js # any other port
  *   HOST=0.0.0.0 ...                                   # listen beyond loopback (e.g. for a container)
+ *   VOICES_DELAY_MS=30000 ...                          # hold the voices answer, like a cold start
+ *   VOICES_MODE=404 ...                                # how /v1/audio/voices answers (see below)
  *
+ * GET  /v1/audio/voices  -> by mode (VOICES_MODE, or switched while running, see /__voices):
+ *                             ok     200 {"status":"ok","voices":["Abigail.wav", ...]} (28 files,
+ *                                    as Chatterbox behind llama-swap answers) - the default
+ *                             empty  200 {"status":"ok","voices":[]}
+ *                             404 | 405 | 500   that status and a small text body
+ *                             hang   the request is never answered (until the client gives up)
+ *                             close  the connection is destroyed without an answer
+ *                           ok and empty wait VOICES_DELAY_MS first if it is set.
+ * GET  /__voices?mode=404 -> switch the voices mode while running; answers {"mode": ...}.
+ *                           GET /__voices alone reports {"mode", "requests"} (voices requests so far).
  * POST /v1/audio/speech  -> a 0.4 s mono 16-bit 22.05 kHz WAV (quiet 440 Hz tone).
  * GET  /article.html     -> tests/fixtures/article.html, so a page can be served from the same place.
  * Every request is logged to stdout as one line; request bodies are not printed.
@@ -15,7 +27,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const PORT = Number(process.env.PORT || process.argv[2] || 8000);
+const PORT = Number(process.env.PORT || process.argv[2] || 8090);
 const HOST = process.env.HOST || '127.0.0.1';
 
 function makeWav({ seconds = 0.4, sampleRate = 22050, frequency = 440, amplitude = 0.2 } = {}) {
@@ -46,6 +58,39 @@ function makeWav({ seconds = 0.4, sampleRate = 22050, frequency = 440, amplitude
 
 const WAV = makeWav();
 
+// 28 voice files, Abigail to Thomas, in the order the server lists them.
+const VOICES = [
+  'Abigail', 'Adrian', 'Alexander', 'Alice', 'Austin', 'Axel', 'Bella', 'Brian', 'Connor', 'Cora',
+  'Elena', 'Emily', 'Everett', 'Gabriel', 'Gianna', 'Henry', 'Jade', 'Jeremiah', 'Jordan', 'Julian',
+  'Layla', 'Leonardo', 'Michael', 'Miles', 'Olivia', 'Ryan', 'Taylor', 'Thomas'
+].map((name) => `${name}.wav`);
+
+const VOICES_MODES = ['ok', 'empty', '404', '405', '500', 'hang', 'close'];
+const state = {
+  mode: VOICES_MODES.includes(process.env.VOICES_MODE) ? process.env.VOICES_MODE : 'ok',
+  voicesRequests: 0
+};
+
+function answerVoices(req, res, cors) {
+  state.voicesRequests++;
+  const { mode } = state;
+  if (mode === 'hang') return; // never answered; the client's abort or timeout ends it
+  if (mode === 'close') {
+    req.socket.destroy();
+    return;
+  }
+  if (mode === '404' || mode === '405' || mode === '500') {
+    res.writeHead(Number(mode), { ...cors, 'Content-Type': 'text/plain' });
+    res.end(`voices: ${mode}`);
+    return;
+  }
+  const delay = Number(process.env.VOICES_DELAY_MS || 0);
+  setTimeout(() => {
+    res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', voices: mode === 'empty' ? [] : VOICES }));
+  }, delay);
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
   console.log(`${new Date().toISOString()} ${req.method} ${url.pathname}`);
@@ -57,6 +102,24 @@ const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, cors);
     res.end();
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/__voices') {
+    const wanted = url.searchParams.get('mode');
+    if (wanted !== null) {
+      if (!VOICES_MODES.includes(wanted)) {
+        res.writeHead(400, cors);
+        res.end(`mode must be one of ${VOICES_MODES.join(', ')}`);
+        return;
+      }
+      state.mode = wanted;
+    }
+    res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ mode: state.mode, requests: state.voicesRequests }));
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/v1/audio/voices') {
+    answerVoices(req, res, cors);
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/audio/speech') {
@@ -80,4 +143,4 @@ if (require.main === module) {
   server.listen(PORT, HOST, () => console.log(`fake TTS server on http://${HOST}:${PORT}`));
 }
 
-module.exports = { server, makeWav };
+module.exports = { server, makeWav, VOICES, VOICES_MODES, state };
