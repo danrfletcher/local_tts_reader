@@ -26,9 +26,11 @@ function liveSession(bg) {
 /**
  * A fetch that holds every request until the test resolves it. Each entry
  * records which sentence index it asked for and its AbortSignal. With
- * `auto: true` it answers at once, like a fast server.
+ * `auto: true` it answers at once, like a fast server. A voices GET is
+ * answered from `fetch.voices` (see createFakeFetch) and kept out of
+ * `entries` and `calls`, so the speech bookkeeping below is unchanged.
  */
-function createGatedFetch(sentences = SENTENCES, { auto = false } = {}) {
+function createGatedFetch(sentences = SENTENCES, { auto = false, voices = true } = {}) {
   const entries = [];
   const fetchFn = createFakeFetch(({ body, signal }) => {
     const index = sentences.indexOf(body.input);
@@ -50,7 +52,7 @@ function createGatedFetch(sentences = SENTENCES, { auto = false } = {}) {
         reject(error);
       });
     });
-  });
+  }, { voices });
   fetchFn.entries = entries;
   /** Fetch entries for one sentence index. */
   fetchFn.forIndex = (index) => entries.filter((e) => e.index === index);

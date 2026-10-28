@@ -287,20 +287,95 @@ function createFakeChrome(options = {}) {
 
 // --- Fake fetch -------------------------------------------------------------
 
+const DEFAULT_VOICE_LIST = ['Olivia.wav', 'Abigail.wav', 'Thomas.wav'];
+
+function isVoicesUrl(url) {
+  return /\/audio\/voices(\?|$)/.test(String(url));
+}
+
+function abortError() {
+  const error = new Error('The operation was aborted.');
+  error.name = 'AbortError';
+  return error;
+}
+
+/**
+ * The response for a voices GET. `spec` picks one of:
+ *   { voices: [...] }      200 {status: 'ok', voices}  (the Chatterbox/llama-swap shape; the default)
+ *   { bare: [...] }        200 with a bare array (the Kokoro shape)
+ *   { status: N }          that status with an empty JSON body (404, 405, 401, 403, 500 ...)
+ *   { text: '<html>' }     a body that is not JSON (status defaults to 200)
+ *   { networkError: true } fetch rejects, as a refused connection does
+ *   { hang: true }         never answers; rejects with AbortError when the signal fires
+ */
+function voicesAnswer(spec, signal) {
+  if (spec.networkError) throw new TypeError('Failed to fetch');
+  if (spec.hang) return hangUntilAbort(signal);
+  if (spec.text !== undefined) return textResponse(spec.text, spec.status === undefined ? 200 : spec.status);
+  if (spec.status !== undefined && spec.status !== 200) return jsonResponse({}, spec.status);
+  if (spec.bare) return jsonResponse(spec.bare);
+  return jsonResponse({ status: 'ok', voices: spec.voices === undefined ? DEFAULT_VOICE_LIST : spec.voices });
+}
+
+/**
+ * Route one voices GET. With `spec.gated` the answer is held until the test
+ * calls `entry.respond(answer)` (answer: a spec overriding the rest, default
+ * the plain list); the entry is in `fetch.voiceCalls`.
+ */
+function routeVoices(spec, entry) {
+  if (!spec.gated) return voicesAnswer(spec, entry.signal);
+  return new Promise((resolve, reject) => {
+    entry.respond = (answer = {}) => {
+      entry.settled = true;
+      try {
+        resolve(voicesAnswer({ ...spec, gated: false, ...answer }, entry.signal));
+      } catch (error) {
+        reject(error);
+      }
+    };
+    if (entry.signal) entry.signal.addEventListener('abort', () => reject(abortError()));
+  });
+}
+
 /**
  * `respond({url, init, body, signal, call})` may return a Response-like
  * object, a promise of one, or throw. `hangUntilAbort` builds a response
  * that never arrives and rejects with an AbortError when the signal fires.
+ *
+ * Voices route: a GET of `.../audio/voices` is answered from `fetch.voices`
+ * (see voicesAnswer) instead of `respond`, and is recorded in
+ * `fetch.voiceCalls` and `fetch.log`, never in `fetch.calls`, so a test that
+ * counts speech requests is not disturbed by the voices check. The route is
+ * on when no `respond` is given (the default speech responder) or when
+ * `options.voices` is passed; a custom `respond` without it receives every
+ * request itself, voices GETs included. `options.voices` is the initial
+ * `fetch.voices` spec (or `true` for the default list).
+ *
+ * `fetch.log` lists every request in arrival order: { method, url, voice },
+ * `voice` being the speech request's body.voice.
  */
-function createFakeFetch(respond) {
+function createFakeFetch(respond, options = {}) {
   const calls = [];
+  const log = [];
+  const voiceCalls = [];
+  const voicesOn = !respond || options.voices !== undefined;
   async function fakeFetch(url, init = {}) {
+    if (voicesOn && isVoicesUrl(url)) {
+      const entry = { url, init, signal: init.signal, method: init.method || 'GET', settled: !fakeFetch.voices.gated };
+      voiceCalls.push(entry);
+      log.push({ method: entry.method, url, voice: undefined });
+      return routeVoices(fakeFetch.voices, entry);
+    }
     const call = { url, init, body: init.body ? JSON.parse(init.body) : null };
     calls.push(call);
+    log.push({ method: init.method || 'GET', url, voice: call.body ? call.body.voice : undefined });
     const handler = respond || defaultResponder;
     return handler({ ...call, signal: init.signal, call: calls.length });
   }
   fakeFetch.calls = calls;
+  fakeFetch.log = log;
+  fakeFetch.voiceCalls = voiceCalls;
+  fakeFetch.voices = options.voices && options.voices !== true ? { ...options.voices } : {};
   return fakeFetch;
 }
 

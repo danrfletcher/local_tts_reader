@@ -17,13 +17,13 @@ async function rightClickRead(localStorage) {
   return bg;
 }
 
-test('G10: with nothing stored, a right-click read uses the shared default URL, and the shared (empty) default voice', async () => {
+test('G10: with nothing stored, a right-click read uses the shared default URL, and the first voice the server lists (the shared default voice is empty)', async () => {
   const bg = await rightClickRead({});
   assert.equal(bg.fetch.calls.length, 1);
   assert.equal(bg.fetch.calls[0].url, 'http://localhost:8090/v1/audio/speech');
   assert.equal(bg.fetch.calls[0].url, DEFAULT_SETTINGS.serverUrl);
-  assert.equal(bg.fetch.calls[0].body.voice, DEFAULT_SETTINGS.voice);
-  assert.equal(bg.fetch.calls[0].body.voice, '');
+  assert.equal(DEFAULT_SETTINGS.voice, '');
+  assert.equal(bg.fetch.calls[0].body.voice, 'Olivia.wav', 'empty counts as unset: the first voice of the fake server');
 });
 
 test('G10: a stored old port-8000 default is replaced by the shared default, silently (nothing is written back)', async () => {

@@ -32,7 +32,7 @@ const AUDIO_1KB = Uint8Array.from({ length: 1024 }, (_, i) => (i * 31 + 7) & 0xf
 
 /** A fetch that answers at once with the 1 KB buffer and records which sentence each call asked for. */
 function createRecordingFetch(sentences) {
-  const fetchFn = createFakeFetch(() => okResponse(AUDIO_1KB));
+  const fetchFn = createFakeFetch(() => okResponse(AUDIO_1KB), { voices: true });
   /** Sentence indexes fetched so far, in call order. */
   fetchFn.indexes = () => fetchFn.calls.map((c) => sentences.indexOf(c.body.input));
   return fetchFn;

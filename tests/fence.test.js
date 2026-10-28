@@ -108,8 +108,34 @@ test('F4: no sendBeacon, XHR, socket or extra fetch anywhere in the extension co
     const text = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''); // comments may mention fetch()
     assert.ok(!/sendBeacon|XMLHttpRequest|WebSocket|EventSource/.test(text), `${file} has no beacon/XHR/socket`);
     const fetchCalls = (text.match(/\bfetch\s*\(/g) || []).length;
+    // background.js has the one speech fetch; its voices check goes through
+    // TTSVoices.checkVoices (pinned in the next test), not a fetch( of its own.
     assert.equal(fetchCalls, file === 'background.js' ? 1 : 0, `${file} fetch() calls`);
   }
+});
+
+test('F2: background.js has two request call sites: the speech POST per sentence, and the one voices check at right-click read start', () => {
+  const strip = (source) => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const background = strip(read('background.js'));
+
+  // The speech fetch: the only fetch( in the file, a POST in fetchChunkAudio.
+  assert.equal((background.match(/\bfetch\s*\(/g) || []).length, 1);
+  assert.match(background, /async function fetchChunkAudio\([\s\S]*?await fetch\(s\.settings\.serverUrl, \{\s*method: 'POST',/);
+
+  // The voices check: one call to TTSVoices.checkVoices, in chooseReadVoice, which
+  // is called once, from startReadingFromTab, before beginSession.
+  assert.equal((background.match(/TTSVoices\.checkVoices\(/g) || []).length, 1);
+  assert.match(background, /async function chooseReadVoice\([\s\S]*?await TTSVoices\.checkVoices\(\{ serverUrl, signal: controller\.signal \}\);/);
+  assert.equal((background.match(/\bchooseReadVoice\(/g) || []).length, 2, 'the definition and one call');
+  assert.match(background, /async function startReadingFromTab\([\s\S]*?await chooseReadVoice\([\s\S]*?await beginSession\(/);
+
+  // Nothing else in the extension asks for the voices except the popup (pinned below).
+  for (const file of ['offscreen.js', 'lib/playback.js', 'contentScript.js', 'sentenceSplitter.js', 'textProcessor.js', 'audioPlayer.js']) {
+    assert.ok(!/checkVoices|audio\/voices/.test(strip(read(file))), `${file} does not ask for voices`);
+  }
+  // The check writes nothing: no storage call between the start of chooseReadVoice and startReadingFromTab.
+  const chooser = background.slice(background.indexOf('async function chooseReadVoice('), background.indexOf('async function startReadingFromTab('));
+  assert.ok(!/chrome\.storage/.test(chooser), 'chooseReadVoice does not touch chrome.storage');
 });
 
 test('F7: the voices request has one call site (popup.js -> TTSVoices.checkVoices -> doFetch), a plain GET with only a signal', () => {
@@ -250,4 +276,20 @@ test('F7: popup.html range inputs are still only speed and seekBar', () => {
   const html = read('popup.html');
   const ranges = [...html.matchAll(/<input[^>]*type="range"[^>]*>/g)].map((m) => m[0].match(/id="([^"]+)"/)[1]);
   assert.deepEqual(ranges.sort(), ['seekBar', 'speed']);
+});
+
+// --- README ----------------------------------------------------------------------------------------------
+
+test('README documents the voices endpoint, every light state, the new default URL and the right-click voice check; nothing stale', () => {
+  const readme = read('README.md').replace(/\s+/g, ' '); // a sentence may wrap across lines
+  for (const needle of [
+    'GET /v1/audio/voices?model=tts-1', '{"voices": [...]}', 'bare array', '404 or 405',
+    'Checking...', 'Starting voice engine...', 'Connected', 'Connected, no voice list', 'Server has no voices',
+    "Can't reach server - is it running?", 'Not authorised', 'Server error N', 'Unexpected', 'Timed out - click the light to retry',
+    'Default server URL: `http://localhost:8090/v1/audio/speech`',
+    'Right-click "Read Aloud"', 'No voice selected - open the popup'
+  ]) {
+    assert.ok(readme.includes(needle), `README mentions ${needle}`);
+  }
+  assert.ok(!/8000|af_bella|am_adam|bf_isabella|## Voice Options/.test(readme), 'no stale Kokoro list, voice or port');
 });

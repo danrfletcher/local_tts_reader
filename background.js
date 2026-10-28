@@ -307,13 +307,80 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   }
 });
 
+// --- Read-start voice check (right-click Read Aloud) -----------------------
+// Before the read begins, the saved voice is checked against the voices the
+// connected server offers (G9): this path never opens the popup, so nothing
+// else would. The current reading is stopped and the existing "starting" state
+// is shown at once, because the check can take ~30 s on a cold server.
+const NO_VOICE_MESSAGE = 'No voice selected - open the popup';
+
+// The voices fetch of the right-click start that is waiting on it, if any. A
+// newer start aborts it (see abortPendingVoiceCheck), so only the latest
+// start's check is ever in flight.
+let pendingVoiceCheck = null;
+
+function abortPendingVoiceCheck() {
+  if (!pendingVoiceCheck) return;
+  const controller = pendingVoiceCheck;
+  pendingVoiceCheck = null;
+  controller.abort();
+}
+
+/**
+ * One voices fetch (90 s cap, its own AbortController) and the voice a read
+ * should send:
+ *   { voice }    - what to send
+ *   { error }    - no read should start; the message to show
+ *   { aborted }  - a newer start cancelled the check
+ * The list offers the saved voice: that voice. It does not (or the saved voice
+ * is empty or the old default): the first voice, without a note. No voice list
+ * (404/405, or an address that has no voices URL), or the check failed in any
+ * way: the saved voice as is, which is empty only when there is nothing to
+ * send. Nothing is written to storage here.
+ */
+async function chooseReadVoice(serverUrl, savedVoice) {
+  const controller = new AbortController();
+  pendingVoiceCheck = controller;
+  let result;
+  try {
+    result = await TTSVoices.checkVoices({ serverUrl, signal: controller.signal });
+  } catch (error) {
+    console.warn('[TTS Reader] Voices check failed:', TTSPlayback.sanitizeError(error));
+    result = { state: TTSVoices.CONN.FAILED };
+  } finally {
+    if (pendingVoiceCheck === controller) pendingVoiceCheck = null;
+  }
+  if (result.aborted) return { aborted: true };
+
+  const saved = typeof savedVoice === 'string' ? savedVoice : '';
+  if (result.state === TTSVoices.CONN.OK) {
+    return { voice: TTSVoices.reconcileVoice(saved, result.voices).voice };
+  }
+  if (result.state === TTSVoices.CONN.NO_VOICES) return { error: TTSVoices.REASONS.NO_VOICES };
+  if (saved.trim() === '') return { error: NO_VOICE_MESSAGE };
+  return { voice: saved };
+}
+
 // contentScript.js's prepareSession() already falls back to the whole
 // page when there's no active selection, so 'selection' mode covers
 // both "text selected" and "nothing selected -> read the page" cases.
 async function startReadingFromTab(tabId, frameId) {
   const token = startTokens.next();
+  abortPendingVoiceCheck(); // this start replaces the one still waiting on its voices
   try {
     await ensureHydrated(); // a restarted worker's paused session is replaced like any other
+    if (!startTokens.isCurrent(token)) {
+      logSupersededStart('queued');
+      return;
+    }
+    // Stop the current reading now, not after the voices answer, and show the
+    // existing cold-start state. beginSession is told it need not stop again.
+    stopSession('replaced');
+    if (!tabId) {
+      broadcastError('No active tab to read from.');
+      return;
+    }
+    setPlayerState('starting');
     const settings = await chrome.storage.local.get({
       serverUrl: DEFAULT_SETTINGS.serverUrl,
       voice: DEFAULT_SETTINGS.voice,
@@ -326,10 +393,24 @@ async function startReadingFromTab(tabId, frameId) {
       logSupersededStart('queued');
       return;
     }
-    await beginSession(tabId, settings, settings.recordAudio, 'selection', frameId, token);
+    const choice = await chooseReadVoice(settings.serverUrl, settings.voice);
+    if (!startTokens.isCurrent(token) || choice.aborted) {
+      logSupersededStart('voice-check'); // a newer start owns the session and the player state now
+      return;
+    }
+    if (choice.error) {
+      broadcastError(choice.error);
+      setPlayerState('stopped'); // leave the "starting" state: nothing is going to start
+      return;
+    }
+    settings.voice = choice.voice;
+    await beginSession(tabId, settings, settings.recordAudio, 'selection', frameId, token, { alreadyStopped: true });
   } catch (error) {
     console.error('Error starting reading from tab:', error);
-    if (startTokens.isCurrent(token)) broadcastError(error.message);
+    if (startTokens.isCurrent(token)) {
+      broadcastError(error.message);
+      if (currentPlayerState === 'starting') setPlayerState('stopped');
+    }
   }
 }
 
@@ -726,13 +807,19 @@ function logSupersededStart(stage, sessionId) {
 // arrived; a direct call without one takes its token now. After every await
 // below, a start that is no longer the latest returns without touching
 // `session` (and tears down its own session if it had already created one).
-async function beginSession(tabId, settings, isRecording, mode, frameId, token = startTokens.next()) {
+// `alreadyStopped` is for the right-click start, which stopped the previous
+// session itself before its voices check; stopping again would repeat the stop
+// broadcast and flip the player state back to "stopped" after "starting".
+async function beginSession(tabId, settings, isRecording, mode, frameId, token = startTokens.next(), { alreadyStopped = false } = {}) {
+  // A right-click start still waiting on its voices is superseded by this one.
+  abortPendingVoiceCheck();
+
   // Mint before replacing the old session so a new id never repeats the id
   // of the session it replaces.
   const sessionId = TTSPlayback.mintSessionId(Math.random, (id) => !!session && session.sessionId === id);
 
   // Any previous session is replaced.
-  stopSession('replaced');
+  if (!alreadyStopped) stopSession('replaced');
 
   if (!tabId) {
     broadcastError('No active tab to read from.');
