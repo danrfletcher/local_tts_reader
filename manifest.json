@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OpenAI Compatible TTS Reader",
-  "version": "1.0",
+  "version": "0.1.0",
   "description": "Reads webpage content using OpenAI compatible TTS service",
   "permissions": [
     "activeTab",
