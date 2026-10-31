@@ -29,13 +29,19 @@ let checkController = null;
 let checkSeq = 0;
 let startingTimer = null;
 let urlCheckTimer = null;
+// The Server URL box has been edited and its debounced check has not started
+// yet. The light still shows the old server's state, so the old list and the
+// old green must not let Play send the new, unchecked URL: the gate is closed
+// from the edit until the check starts (which closes it itself, as Checking).
+let urlEditPending = false;
 // What the player state alone says about Play; the connection gate is applied on top.
 let playAllowedByPlayer = true;
 
 // The connection's half of the Play gate: connOk, or connNoList with a
-// non-empty voice name (read from whichever voice element is live).
+// non-empty voice name (read from whichever voice element is live), and no
+// Server URL edit waiting for its check.
 function connectionGateOpen() {
-  return TTSVoices.connectionAllowsPlay(connState, currentVoice());
+  return !urlEditPending && TTSVoices.connectionAllowsPlay(connState, currentVoice());
 }
 
 // Play is enabled only when the player state (session gate) and the
@@ -55,10 +61,13 @@ function renderConnection(sessionActive = activeSessionId !== null) {
   light.className = `conn-light ${connState}`;
   light.title = text || 'Not checked yet';
   label.textContent = text;
-  label.hidden = sessionActive || text === '';
+  // Hidden while a session is active so the label and the player's overlay
+  // never both say "Starting voice engine"; the one exception is the note
+  // that explains why the Voice name box is showing instead of a list.
+  label.hidden = (sessionActive && connReason !== TTSVoices.REASONS.CANNOT_DERIVE) || text === '';
 
   voiceGroup.hidden = !voiceListShown;
-  voiceEl.disabled = connState !== CONN.OK; // a re-check keeps the old list, but not usable
+  voiceEl.disabled = connState !== CONN.OK || urlEditPending; // a re-check or a pending URL edit keeps the old list, but not usable
   // The Voice name box is never disabled or rewritten here: the user may be
   // typing in it while a check lands.
   document.getElementById('voiceNameGroup').hidden = !voiceNameShown;
@@ -116,6 +125,7 @@ function cancelConnectionCheck() {
 // check's result is applied (an aborted fetch is silent).
 async function runConnectionCheck() {
   cancelConnectionCheck();
+  urlEditPending = false; // the check below (connChecking) keeps the gate closed from here
   const controller = new AbortController();
   checkController = controller;
   const seq = ++checkSeq;
@@ -150,10 +160,13 @@ async function runConnectionCheck() {
 // Every edit aborts the running check at once (not only when the debounce
 // fires), so a check for the old URL cannot land while the box shows a new one.
 // Bumping checkSeq drops a result that already resolved. The light stays as it
-// was (Checking... if a check was running) until the debounced check starts.
+// was (Checking... if a check was running) until the debounced check starts,
+// but Play and the list are closed from the edit (urlEditPending).
 function scheduleConnectionCheck() {
   cancelConnectionCheck();
   checkSeq++;
+  urlEditPending = true;
+  renderConnection();
   urlCheckTimer = setTimeout(() => {
     urlCheckTimer = null;
     runConnectionCheck().catch((error) => console.error('Error checking the voices:', error));
@@ -161,10 +174,11 @@ function scheduleConnectionCheck() {
 }
 
 // The voice a new session would use, read from whichever element is live: the
-// typed name while the Voice name box shows, the picked option while the list
-// shows, otherwise the stored one.
+// typed name (without leading or trailing spaces, as the Play gate reads it)
+// while the Voice name box shows, the picked option while the list shows,
+// otherwise the stored one.
 function currentVoice() {
-  if (voiceNameShown) return document.getElementById('voiceName').value;
+  if (voiceNameShown) return document.getElementById('voiceName').value.trim();
   return voiceListShown ? document.getElementById('voice').value : savedVoice;
 }
 
@@ -248,8 +262,10 @@ function updateControlButtons(state, sessionActive = activeSessionId !== null) {
   // Hide loading indicator by default
   loadingIndicator.style.display = 'none';
 
-  // Stop button is always enabled (except during loading/starting)
-  stopBtn.disabled = state === 'loading' || state === 'starting';
+  // Stop button is always enabled, except during loading and during starting
+  // with a session. Starting with no session is a right-click read still
+  // waiting on its voices check: Stop cancels it.
+  stopBtn.disabled = state === 'loading' || (state === 'starting' && sessionActive);
 
   switch(state) {
     case 'starting':
@@ -337,10 +353,11 @@ async function saveVoice() {
 }
 
 // The typed Voice name saves on every `input` (the only other write of
-// `voice` besides a pick). Play follows the box at once: enabled only while
-// it is non-empty.
+// `voice` besides a pick), trimmed: the box keeps what was typed, but the
+// stored and sent name has no stray spaces. Play follows the box at once:
+// enabled only while it is non-empty.
 async function saveTypedVoice() {
-  savedVoice = document.getElementById('voiceName').value;
+  savedVoice = document.getElementById('voiceName').value.trim();
   refreshPlayGate();
   try {
     await chrome.storage.local.set({ voice: savedVoice });
