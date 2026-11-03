@@ -108,8 +108,10 @@ engine...", asks the voices endpoint once (up to 90 s) and sends your saved
 voice if the server offers it, otherwise the first voice. If the server has no
 voice list the saved voice is sent as it is; if the check fails the read starts
 with the saved voice and any error shows as usual. With no saved voice and no
-list, no read starts and it says "No voice selected - open the popup". This
-check never changes your saved settings.
+list, no read starts and it says "No voice selected - open the popup". If the
+server answers with an empty voice list, no read starts either and it says
+"Server has no voices". Stop cancels a read that is still waiting on this
+check. This check never changes your saved settings.
 
 ## Server Requirements
 

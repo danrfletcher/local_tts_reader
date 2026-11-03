@@ -27,7 +27,9 @@ test('starting and loading enable Pause once a session exists, and keep it disab
     updateControlButtons(state, true);
     assert.deepEqual(popup.buttons(), { play: true, pause: false, stop: true }, `${state} with a session`);
     updateControlButtons(state, false);
-    assert.deepEqual(popup.buttons(), { play: true, pause: true, stop: true }, `${state} without one`);
+    // Stop (disabled: true) stays off in 'loading'; 'starting' with no session is
+    // a right-click read waiting on its voices check, which Stop cancels.
+    assert.deepEqual(popup.buttons(), { play: true, pause: true, stop: state === 'loading' }, `${state} without one`);
   }
 });
 

@@ -355,8 +355,9 @@ test('G4/E11: Play is enabled only while the Voice name is non-empty; typing sav
   assert.equal(popup.getEl('playBtn').disabled, false, 're-typed: enabled');
   await typeVoiceName(popup, 'Thomas.wav');
 
+  // Saved trimmed: a blanks-only name is stored as ''.
   assert.deepEqual(popup.storageSets, [
-    { voice: '' }, { voice: '   ' }, { voice: 'Thomas' }, { voice: 'Thomas.wav' }
+    { voice: '' }, { voice: '' }, { voice: 'Thomas' }, { voice: 'Thomas.wav' }
   ]);
   assert.equal(popup.getEl('voiceName').listeners.input.length, 1);
 });

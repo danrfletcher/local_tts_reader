@@ -335,8 +335,11 @@ function abortPendingVoiceCheck() {
  * The list offers the saved voice: that voice. It does not (or the saved voice
  * is empty or the old default): the first voice, without a note. No voice list
  * (404/405, or an address that has no voices URL), or the check failed in any
- * way: the saved voice as is, which is empty only when there is nothing to
- * send. Nothing is written to storage here.
+ * way: the saved voice as is (without stray spaces), which is empty only when
+ * there is nothing to send. That includes the old default voice: it counts
+ * as unset only against a list that does not offer it, so when there is no
+ * list to say so it is sent as is, like any other saved voice. Nothing is
+ * written to storage here.
  */
 async function chooseReadVoice(serverUrl, savedVoice) {
   const controller = new AbortController();
@@ -358,7 +361,22 @@ async function chooseReadVoice(serverUrl, savedVoice) {
   }
   if (result.state === TTSVoices.CONN.NO_VOICES) return { error: TTSVoices.REASONS.NO_VOICES };
   if (saved.trim() === '') return { error: NO_VOICE_MESSAGE };
-  return { voice: saved };
+  return { voice: saved.trim() };
+}
+
+/**
+ * A user Stop (the id-less stop) while a right-click start is still waiting on
+ * its voices check, or between that check and the session: no session is live,
+ * but the player shows "starting". Taking a token makes the start give up at
+ * its next check, the voices fetch is aborted and the player goes to stopped.
+ * False when there is no such start (a live session is stopped by stopSession).
+ */
+function cancelStartInProgress() {
+  if (currentPlayerState !== 'starting' || (session && !session.stopped)) return false;
+  startTokens.next();
+  abortPendingVoiceCheck();
+  setPlayerState('stopped');
+  return true;
 }
 
 // contentScript.js's prepareSession() already falls back to the whole
@@ -621,6 +639,7 @@ function handleControlAudio(message) {
   if (action === 'stop') {
     // No id: the overlay's Escape / close button, always a Stop.
     if (message.sessionId == null) {
+      if (cancelStartInProgress()) return;
       stopSession('user');
       return;
     }
